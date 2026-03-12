@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,8 +38,11 @@ MODE_LABELS = {
     MODE_BEREAL_BACK_TL: "BeReal style (back top-left)",
 }
 
-BROWSER_FILENAME = "filename"
-BROWSER_PREVIEW = "preview"
+GALLERY_MAX_COLUMNS = 1
+CARD_BG_DEFAULT = "#e9ecef"
+CARD_BG_SELECTED = "#cfe8ff"
+CARD_BG_MISSING = "#ffe9e9"
+CARD_BG_DOWNLOADED = "#e9f8ee"
 
 
 @dataclass
@@ -352,21 +356,30 @@ class BeRealDownloaderApp:
 
         self.path_var = tk.StringVar(value=str(Path.cwd()))
         self.mode_var = tk.StringVar(value=MODE_BEREAL_FRONT_TL)
-        self.browser_mode_var = tk.StringVar(value=BROWSER_FILENAME)
-        self.preview_index_var = tk.IntVar(value=1)
+        self.show_all_metadata_var = tk.BooleanVar(value=False)
         self.skip_existing_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Select an export folder and click Load Data.")
+        self.selection_status_var = tk.StringVar(value="Selected: 0")
 
-        self.filename_listbox: Optional[tk.Listbox] = None
-        self.preview_frame: Optional[ttk.Frame] = None
-        self.filename_frame: Optional[ttk.Frame] = None
-        self.preview_image_label: Optional[ttk.Label] = None
-        self.preview_meta_var = tk.StringVar(value="")
-        self.preview_filename_var = tk.StringVar(value="")
-        self.preview_index_label_var = tk.StringVar(value="0 / 0")
-        self.preview_scale: Optional[ttk.Scale] = None
-        self.preview_photo_image = None
-        self.preview_updating = False
+        self.table_item_by_photo_key: Dict[str, str] = {}
+        self.suppress_table_select_event = False
+
+        self.selected_photo_keys: set[str] = set()
+        self.selection_anchor_index: Optional[int] = None
+
+        self.scroller_container: Optional[ttk.Frame] = None
+        self.gallery_canvas: Optional[tk.Canvas] = None
+        self.gallery_inner: Optional[ttk.Frame] = None
+        self.gallery_scrollbar: Optional[ttk.Scrollbar] = None
+        self.gallery_window_id: Optional[int] = None
+        self.gallery_cards: List[Dict] = []
+        self.gallery_thumbnail_refs: Dict[Tuple[str, str], "ImageTk.PhotoImage"] = {}
+        self.card_meta_visible_keys: set[str] = set()
+        self.thumbnail_job_queue = deque()
+        self.thumbnail_job_set: set[int] = set()
+        self.thumbnail_job_after_id: Optional[str] = None
+        self.thumbnail_request_after_id: Optional[str] = None
+        self.last_target_preview_width: int = 0
 
         self._build_ui()
         self._configure_row_tags()
@@ -405,6 +418,7 @@ class BeRealDownloaderApp:
             text="Skip already downloaded entries for selected mode",
             variable=self.skip_existing_var,
         ).pack(side=tk.LEFT)
+        ttk.Label(action_frame, textvariable=self.selection_status_var).pack(side=tk.LEFT, padx=(14, 0))
 
         ttk.Button(action_frame, text="Download Selected", command=self.on_download_selected).pack(
             side=tk.RIGHT, padx=(6, 0)
@@ -456,6 +470,7 @@ class BeRealDownloaderApp:
         y_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.table.yview)
         x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.table.xview)
         self.table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.table.bind("<<TreeviewSelect>>", self.on_table_selection_changed)
 
         self.table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -470,75 +485,39 @@ class BeRealDownloaderApp:
         top = ttk.Frame(parent, padding=(8, 8, 8, 4))
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="Browse style:").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Radiobutton(
+        ttk.Label(
             top,
-            text="Filename list",
-            value=BROWSER_FILENAME,
-            variable=self.browser_mode_var,
-            command=self.on_browser_mode_changed,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Radiobutton(
-            top,
-            text="Image preview",
-            value=BROWSER_PREVIEW,
-            variable=self.browser_mode_var,
-            command=self.on_browser_mode_changed,
+            text="Image preview scroller (1 per row). Click to select, Shift+Click for range. Use the i button for metadata.",
         ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            top,
+            text="Show metadata on all cards",
+            variable=self.show_all_metadata_var,
+            command=self.on_toggle_all_metadata,
+        ).pack(side=tk.RIGHT)
 
-        container = ttk.Frame(parent, padding=(8, 4, 8, 8))
-        container.pack(fill=tk.BOTH, expand=True)
+        self.scroller_container = ttk.Frame(parent, padding=(8, 4, 8, 8))
+        self.scroller_container.pack(fill=tk.BOTH, expand=True)
 
-        self.filename_frame = ttk.Frame(container)
-        self.preview_frame = ttk.Frame(container)
-
-        self._build_filename_browser(self.filename_frame)
-        self._build_preview_browser(self.preview_frame)
-
-        self.on_browser_mode_changed()
-
-    def _build_filename_browser(self, parent: ttk.Frame) -> None:
-        parent.pack(fill=tk.BOTH, expand=True)
-        list_frame = ttk.Frame(parent)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.filename_listbox = tk.Listbox(
-            list_frame,
-            activestyle="none",
-            selectmode=tk.SINGLE,
-            font=("Menlo", 11) if sys.platform == "darwin" else ("Courier", 10),
+        self.gallery_canvas = tk.Canvas(self.scroller_container, highlightthickness=0)
+        self.gallery_scrollbar = ttk.Scrollbar(
+            self.scroller_container, orient=tk.VERTICAL, command=self.gallery_canvas.yview
         )
-        y_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.filename_listbox.yview)
-        self.filename_listbox.configure(yscrollcommand=y_scroll.set)
+        self.gallery_canvas.configure(yscrollcommand=self.gallery_scrollbar.set)
 
-        self.filename_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.gallery_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.gallery_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    def _build_preview_browser(self, parent: ttk.Frame) -> None:
-        parent.pack(fill=tk.BOTH, expand=True)
+        self.gallery_inner = ttk.Frame(self.gallery_canvas)
+        self.gallery_window_id = self.gallery_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
+        for c in range(GALLERY_MAX_COLUMNS):
+            self.gallery_inner.columnconfigure(c, weight=1)
 
-        nav = ttk.Frame(parent)
-        nav.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Button(nav, text="Previous", command=self.on_preview_previous).pack(side=tk.LEFT)
-        ttk.Button(nav, text="Next", command=self.on_preview_next).pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Label(nav, textvariable=self.preview_index_label_var).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Label(nav, text="Scroll bar:").pack(side=tk.LEFT, padx=(0, 8))
-
-        self.preview_scale = ttk.Scale(nav, from_=1, to=1, command=self.on_preview_scale_changed)
-        self.preview_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        canvas_holder = ttk.Frame(parent)
-        canvas_holder.pack(fill=tk.BOTH, expand=True)
-
-        self.preview_image_label = ttk.Label(canvas_holder, anchor="center")
-        self.preview_image_label.pack(fill=tk.BOTH, expand=True)
-        self.preview_image_label.bind("<MouseWheel>", self.on_preview_mouse_wheel)
-        self.preview_image_label.bind("<Button-4>", self.on_preview_mouse_wheel)
-        self.preview_image_label.bind("<Button-5>", self.on_preview_mouse_wheel)
-
-        ttk.Label(parent, textvariable=self.preview_filename_var, anchor="w").pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(parent, textvariable=self.preview_meta_var, anchor="w").pack(fill=tk.X, pady=(2, 0))
+        self.gallery_inner.bind("<Configure>", self.on_gallery_inner_configure)
+        self.gallery_canvas.bind("<Configure>", self.on_gallery_canvas_configure)
+        self.gallery_canvas.bind("<MouseWheel>", self.on_gallery_mouse_wheel)
+        self.gallery_canvas.bind("<Button-4>", self.on_gallery_mouse_wheel)
+        self.gallery_canvas.bind("<Button-5>", self.on_gallery_mouse_wheel)
 
     def _configure_row_tags(self) -> None:
         self.table.tag_configure("missing", background="#ffe9e9")
@@ -548,130 +527,448 @@ class BeRealDownloaderApp:
         self.refresh_table()
         self.refresh_scroller()
 
-    def on_browser_mode_changed(self) -> None:
-        if self.filename_frame is None or self.preview_frame is None:
-            return
-
-        self.filename_frame.pack_forget()
-        self.preview_frame.pack_forget()
-
-        if self.browser_mode_var.get() == BROWSER_PREVIEW:
-            self.preview_frame.pack(fill=tk.BOTH, expand=True)
-            self.refresh_preview_panel()
-        else:
-            self.filename_frame.pack(fill=tk.BOTH, expand=True)
-
     def refresh_scroller(self) -> None:
-        self.refresh_filename_browser()
-        if self.preview_scale is not None:
-            max_value = max(1, len(self.photos))
-            self.preview_scale.configure(from_=1, to=max_value)
-        if len(self.photos) == 0:
-            self.preview_index_var.set(1)
-        else:
-            self.preview_index_var.set(min(max(self.preview_index_var.get(), 1), len(self.photos)))
-        self.refresh_preview_panel()
-
-    def refresh_filename_browser(self) -> None:
-        if self.filename_listbox is None:
+        if self.gallery_inner is None:
             return
 
-        self.filename_listbox.delete(0, tk.END)
+        self._cancel_thumbnail_loading()
+        self.gallery_thumbnail_refs.clear()
+        self.gallery_cards.clear()
+
+        for child in self.gallery_inner.winfo_children():
+            child.destroy()
+
+        for idx, photo in enumerate(self.photos):
+            card = self._create_gallery_card(idx, photo)
+            self.gallery_cards.append(card)
+            self._place_card(card)
+
+        self.last_target_preview_width = self._current_target_preview_width()
+        self.update_gallery_scrollregion()
+        self._schedule_thumbnail_request(1)
+        self.refresh_gallery_selection_styles()
+        self.update_selection_status()
+
+    def _create_gallery_card(self, idx: int, photo: MemoryPhoto) -> Dict:
+        assert self.gallery_inner is not None
+
+        frame = tk.Frame(
+            self.gallery_inner,
+            bd=0,
+            relief=tk.FLAT,
+            highlightthickness=0,
+            padx=0,
+            pady=0,
+            cursor="hand2",
+        )
+
+        image_label = tk.Label(
+            frame,
+            text="",
+            anchor="center",
+            justify="center",
+            bd=0,
+            highlightthickness=0,
+            fg="#111111",
+        )
+        image_label.pack(anchor="center")
+
+        meta_button = tk.Button(
+            image_label,
+            text="i",
+            font=("Helvetica", 8, "bold"),
+            width=1,
+            height=1,
+            padx=2,
+            pady=0,
+            bd=0,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=lambda k=photo.key: self.show_card_metadata(k),
+        )
+        meta_button.place(relx=1.0, x=-6, y=6, anchor="ne")
+
+        meta_label = tk.Label(frame, anchor="w", justify="left", wraplength=230)
+
+        card = {
+            "index": idx,
+            "photo": photo,
+            "frame": frame,
+            "image_label": image_label,
+            "meta_button": meta_button,
+            "meta_label": meta_label,
+            "meta_visible": False,
+        }
+
+        for widget in (frame, image_label, meta_label):
+            widget.bind("<Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e))
+            widget.bind("<Shift-Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e))
+            widget.bind("<MouseWheel>", self.on_gallery_mouse_wheel)
+            widget.bind("<Button-4>", self.on_gallery_mouse_wheel)
+            widget.bind("<Button-5>", self.on_gallery_mouse_wheel)
+
+        self._populate_card_labels(card)
+        self.update_card_metadata_visibility(card)
+        self._apply_gallery_card_style(card)
+        return card
+
+    def _populate_card_labels(self, card: Dict) -> None:
+        photo: MemoryPhoto = card["photo"]
+        card["image_label"].configure(text="Loading preview...", image="")
+        card["meta_label"].configure(text=self._format_card_metadata(photo), fg="#111111")
+
+    def _format_card_metadata(self, photo: MemoryPhoto) -> str:
         mode = self.mode_var.get()
-
-        for idx, photo in enumerate(self.photos, start=1):
-            rel = self.exporter.planned_relative_path(photo, mode)
-            downloaded = "downloaded" if self.history.has_mode(photo.key, mode) else "new"
-            line = f"{idx:04d}  {rel}  [{downloaded}]"
-            self.filename_listbox.insert(tk.END, line)
-
-        if self.photos:
-            self.filename_listbox.selection_set(0)
-            self.filename_listbox.see(0)
-
-    def on_preview_previous(self) -> None:
-        self.set_preview_index(self.preview_index_var.get() - 1)
-
-    def on_preview_next(self) -> None:
-        self.set_preview_index(self.preview_index_var.get() + 1)
-
-    def on_preview_scale_changed(self, value: str) -> None:
-        if self.preview_updating:
-            return
-        try:
-            index = int(float(value))
-        except ValueError:
-            return
-        self.set_preview_index(index)
-
-    def on_preview_mouse_wheel(self, event: tk.Event) -> None:
-        delta = 0
-        if hasattr(event, "delta") and event.delta:
-            delta = -1 if event.delta > 0 else 1
-        elif getattr(event, "num", None) == 4:
-            delta = -1
-        elif getattr(event, "num", None) == 5:
-            delta = 1
-
-        if delta != 0:
-            self.set_preview_index(self.preview_index_var.get() + delta)
-
-    def set_preview_index(self, one_based_index: int) -> None:
-        if not self.photos:
-            self.preview_index_var.set(1)
-            self.refresh_preview_panel()
-            return
-
-        clamped = min(max(one_based_index, 1), len(self.photos))
-        self.preview_index_var.set(clamped)
-        self.refresh_preview_panel()
-
-    def refresh_preview_panel(self) -> None:
-        total = len(self.photos)
-        current = self.preview_index_var.get()
-
-        if total == 0:
-            self.preview_index_label_var.set("0 / 0")
-            self.preview_filename_var.set("")
-            self.preview_meta_var.set("No photos loaded")
-            if self.preview_image_label is not None:
-                self.preview_image_label.configure(image="", text="")
-            return
-
-        current = min(max(current, 1), total)
-        self.preview_index_var.set(current)
-        self.preview_index_label_var.set(f"{current} / {total}")
-
-        if self.preview_scale is not None:
-            self.preview_updating = True
-            try:
-                self.preview_scale.set(current)
-            finally:
-                self.preview_updating = False
-
-        photo = self.photos[current - 1]
-        mode = self.mode_var.get()
-        rel = self.exporter.planned_relative_path(photo, mode)
-        self.preview_filename_var.set(str(rel))
-
         late = "Late" if photo.is_late else "On time"
-        downloaded = "Downloaded for this mode" if self.history.has_mode(photo.key, mode) else "Not downloaded"
-        self.preview_meta_var.set(f"{self._format_time(photo.taken_time)} | {late} | {downloaded}")
+        downloaded = "Downloaded" if self.history.has_mode(photo.key, mode) else "New"
+        rel = self.exporter.planned_relative_path(photo, mode)
+        lines = [
+            f"Taken: {self._format_time(photo.taken_time)}",
+            f"Status: {late} | {downloaded}",
+            f"File: {rel}",
+        ]
+        if photo.caption:
+            lines.append(f"Caption: {photo.caption}")
+        if photo.location:
+            lines.append(f"Location: {self._format_location(photo.location)}")
+        return "\n".join(lines)
 
-        if self.preview_image_label is None:
+    def _place_card(self, card: Dict) -> None:
+        if self.gallery_inner is None:
+            return
+        idx = card["index"]
+        row = idx // GALLERY_MAX_COLUMNS
+        col = idx % GALLERY_MAX_COLUMNS
+        card["frame"].grid(row=row, column=col, sticky="ew", padx=0, pady=8)
+
+    def on_toggle_all_metadata(self) -> None:
+        for card in self.gallery_cards:
+            self.update_card_metadata_visibility(card)
+        self.update_gallery_scrollregion()
+
+    def update_card_metadata_visibility(self, card: Dict) -> None:
+        photo: MemoryPhoto = card["photo"]
+        show = self.show_all_metadata_var.get() or (photo.key in self.card_meta_visible_keys)
+        card["meta_label"].configure(wraplength=max(260, self._current_target_preview_width() - 30))
+
+        if show:
+            if not card["meta_visible"]:
+                card["meta_label"].pack(fill=tk.X, pady=(4, 0))
+                card["meta_visible"] = True
+            card["meta_button"].configure(text="×")
+            card["meta_label"].configure(text=self._format_card_metadata(photo))
+        else:
+            if card["meta_visible"]:
+                card["meta_label"].pack_forget()
+                card["meta_visible"] = False
+            card["meta_button"].configure(text="i")
+
+    def show_card_metadata(self, photo_key: str) -> None:
+        photo = next((p for p in self.photos if p.key == photo_key), None)
+        if photo is None:
             return
 
-        if not photo.front_path.exists() or not photo.back_path.exists():
-            self.preview_image_label.configure(image="", text="Source image missing")
+        if photo_key in self.card_meta_visible_keys:
+            self.card_meta_visible_keys.remove(photo_key)
+        else:
+            self.card_meta_visible_keys.add(photo_key)
+
+        for card in self.gallery_cards:
+            if card["photo"].key == photo_key:
+                self.update_card_metadata_visibility(card)
+                break
+        self.update_gallery_scrollregion()
+
+    def update_gallery_scrollregion(self) -> None:
+        if self.gallery_canvas is None:
+            return
+        self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+
+    def _current_target_preview_width(self) -> int:
+        if self.gallery_canvas is None:
+            return 960
+        canvas_w = self.gallery_canvas.winfo_width()
+        if canvas_w <= 1:
+            return 960
+        # One card per row with small horizontal margin.
+        return min(1700, max(640, canvas_w - 28))
+
+    def _handle_preview_width_change(self) -> None:
+        new_width = self._current_target_preview_width()
+        if self.last_target_preview_width == 0:
+            self.last_target_preview_width = new_width
             return
 
+        # Avoid expensive cache rebuild for tiny resize deltas.
+        if abs(new_width - self.last_target_preview_width) < 24:
+            return
+
+        self.last_target_preview_width = new_width
+        self._invalidate_preview_cache_for_resize()
+
+    def _invalidate_preview_cache_for_resize(self) -> None:
+        self._cancel_thumbnail_loading()
+        self.gallery_thumbnail_refs.clear()
+        for card in self.gallery_cards:
+            card["image_label"].configure(image="", text="Loading preview...")
+            card["image_label"].image = None
+
+    def on_gallery_inner_configure(self, _event: tk.Event) -> None:
+        self.update_gallery_scrollregion()
+
+    def on_gallery_canvas_configure(self, event: tk.Event) -> None:
+        if self.gallery_window_id is not None and self.gallery_canvas is not None:
+            self.gallery_canvas.itemconfigure(self.gallery_window_id, width=event.width)
+        self.update_gallery_scrollregion()
+        self._handle_preview_width_change()
+        self._schedule_thumbnail_request()
+
+    def on_gallery_mouse_wheel(self, event: tk.Event) -> None:
+        if self.gallery_canvas is None:
+            return
+
+        step = 0
+        if hasattr(event, "delta") and event.delta:
+            step = -1 if event.delta > 0 else 1
+        elif getattr(event, "num", None) == 4:
+            step = -1
+        elif getattr(event, "num", None) == 5:
+            step = 1
+
+        if step != 0:
+            self.gallery_canvas.yview_scroll(step * 10, "units")
+            self._schedule_thumbnail_request()
+
+    def on_gallery_item_click(self, idx: int, event: tk.Event) -> None:
+        if idx < 0 or idx >= len(self.photos):
+            return
+
+        shift_down = bool(event.state & 0x0001)
+
+        if shift_down and self.selection_anchor_index is not None:
+            start = min(self.selection_anchor_index, idx)
+            end = max(self.selection_anchor_index, idx)
+            self.selected_photo_keys = {self.photos[i].key for i in range(start, end + 1)}
+        else:
+            clicked_key = self.photos[idx].key
+            if clicked_key in self.selected_photo_keys and len(self.selected_photo_keys) == 1:
+                self.selected_photo_keys.clear()
+            else:
+                self.selected_photo_keys = {clicked_key}
+            self.selection_anchor_index = idx
+
+        self.refresh_gallery_selection_styles()
+        self.sync_table_selection_from_model()
+        self.update_selection_status()
+
+    def refresh_gallery_selection_styles(self) -> None:
+        for card in self.gallery_cards:
+            self._apply_gallery_card_style(card)
+
+    def _apply_gallery_card_style(self, card: Dict) -> None:
+        photo: MemoryPhoto = card["photo"]
+        selected = photo.key in self.selected_photo_keys
+        missing = (not photo.front_path.exists()) or (not photo.back_path.exists())
+        downloaded = self.history.has_mode(photo.key, self.mode_var.get())
+
+        if selected:
+            bg = CARD_BG_SELECTED
+        elif missing:
+            bg = CARD_BG_MISSING
+        elif downloaded:
+            bg = CARD_BG_DOWNLOADED
+        else:
+            bg = CARD_BG_DEFAULT
+
+        for widget in (card["frame"], card["image_label"], card["meta_label"]):
+            widget.configure(bg=bg)
+        card["meta_button"].configure(
+            bg=bg,
+            activebackground=bg,
+            fg="#1f4f7a" if not selected else "#0a2d4a",
+            activeforeground="#0a2d4a",
+        )
+
+    def _schedule_thumbnail_request(self, delay_ms: int = 40) -> None:
+        if self.thumbnail_request_after_id is not None:
+            try:
+                self.root.after_cancel(self.thumbnail_request_after_id)
+            except Exception:
+                pass
+        self.thumbnail_request_after_id = self.root.after(delay_ms, self._run_thumbnail_request)
+
+    def _run_thumbnail_request(self) -> None:
+        self.thumbnail_request_after_id = None
+        self.request_visible_thumbnail_loading()
+
+    def request_visible_thumbnail_loading(self) -> None:
+        if not self.gallery_cards or self.gallery_canvas is None:
+            return
+
+        mode = self.mode_var.get()
+        for idx in self._visible_card_indices():
+            if idx in self.thumbnail_job_set or idx < 0 or idx >= len(self.gallery_cards):
+                continue
+            card = self.gallery_cards[idx]
+            key = (card["photo"].key, mode)
+            if key in self.gallery_thumbnail_refs:
+                card["image_label"].configure(image=self.gallery_thumbnail_refs[key], text="")
+                card["image_label"].image = self.gallery_thumbnail_refs[key]
+                continue
+            self.thumbnail_job_queue.append(idx)
+            self.thumbnail_job_set.add(idx)
+
+        if self.thumbnail_job_after_id is None and self.thumbnail_job_queue:
+            self.thumbnail_job_after_id = self.root.after(1, self._process_thumbnail_batch)
+
+    def _visible_card_indices(self) -> List[int]:
+        if self.gallery_canvas is None:
+            return []
+        y0, y1 = self.gallery_canvas.yview()
+        total = max(1, len(self.gallery_cards))
+        rows = (total + GALLERY_MAX_COLUMNS - 1) // GALLERY_MAX_COLUMNS
+        first_row = max(0, int(y0 * rows) - 2)
+        last_row = min(rows - 1, int(y1 * rows) + 2)
+        indices: List[int] = []
+        for row in range(first_row, last_row + 1):
+            start = row * GALLERY_MAX_COLUMNS
+            end = min(total, start + GALLERY_MAX_COLUMNS)
+            indices.extend(range(start, end))
+        return indices
+
+    def _process_thumbnail_batch(self) -> None:
+        if not self.thumbnail_job_queue:
+            self.thumbnail_job_after_id = None
+            return
+
+        mode = self.mode_var.get()
+        batch_size = 8
+        for _ in range(batch_size):
+            if not self.thumbnail_job_queue:
+                break
+            idx = self.thumbnail_job_queue.popleft()
+            self.thumbnail_job_set.discard(idx)
+            if idx < 0 or idx >= len(self.gallery_cards):
+                continue
+
+            card = self.gallery_cards[idx]
+            photo: MemoryPhoto = card["photo"]
+            key = (photo.key, mode)
+
+            image_obj = self.gallery_thumbnail_refs.get(key)
+            if image_obj is None:
+                image_obj = self._build_thumbnail(photo, mode)
+                if image_obj is not None:
+                    self.gallery_thumbnail_refs[key] = image_obj
+
+            if image_obj is not None:
+                card["image_label"].configure(image=image_obj, text="")
+                card["image_label"].image = image_obj
+            else:
+                card["image_label"].configure(image="", text="Preview unavailable")
+                card["image_label"].image = None
+
+        if self.thumbnail_job_queue:
+            self.thumbnail_job_after_id = self.root.after(8, self._process_thumbnail_batch)
+        else:
+            self.thumbnail_job_after_id = None
+
+    def _cancel_thumbnail_loading(self) -> None:
+        self.thumbnail_job_queue.clear()
+        self.thumbnail_job_set.clear()
+        if self.thumbnail_request_after_id is not None:
+            try:
+                self.root.after_cancel(self.thumbnail_request_after_id)
+            except Exception:
+                pass
+        self.thumbnail_request_after_id = None
+        if self.thumbnail_job_after_id is not None:
+            try:
+                self.root.after_cancel(self.thumbnail_job_after_id)
+            except Exception:
+                pass
+        self.thumbnail_job_after_id = None
+
+    def _build_thumbnail(self, photo: MemoryPhoto, mode: str) -> Optional["ImageTk.PhotoImage"]:
         try:
-            preview = self.exporter.render_output_image(photo, mode)
-            preview.thumbnail((900, 430), Image.Resampling.LANCZOS)
-            self.preview_photo_image = ImageTk.PhotoImage(preview)
-            self.preview_image_label.configure(image=self.preview_photo_image, text="")
-        except Exception as exc:
-            self.preview_image_label.configure(image="", text=f"Preview error: {exc}")
+            if not photo.front_path.exists() or not photo.back_path.exists():
+                return None
+            target_w = self._current_target_preview_width()
+            source_max_side = min(2600, max(1200, target_w * 2))
+
+            if mode == MODE_FRONT_ONLY:
+                img = self._open_preview_image(photo.front_path, source_max_side)
+            elif mode == MODE_BACK_ONLY:
+                img = self._open_preview_image(photo.back_path, source_max_side)
+            elif mode == MODE_BEREAL_FRONT_TL:
+                base = self._open_preview_image(photo.back_path, source_max_side)
+                inset = self._open_preview_image(photo.front_path, max(700, int(source_max_side * 0.58)))
+                img = ImageExporter._compose(base=base, inset=inset)
+            elif mode == MODE_BEREAL_BACK_TL:
+                base = self._open_preview_image(photo.front_path, source_max_side)
+                inset = self._open_preview_image(photo.back_path, max(700, int(source_max_side * 0.58)))
+                img = ImageExporter._compose(base=base, inset=inset)
+            else:
+                img = self._open_preview_image(photo.front_path, source_max_side)
+
+            if img.width > 0 and img.width != target_w:
+                target_h = max(1, int(img.height * (target_w / img.width)))
+                img = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _open_preview_image(path: Path, max_side: int) -> "Image.Image":
+        img = Image.open(path)
+        try:
+            img.draft("RGB", (max_side, max_side))
+        except Exception:
+            pass
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail((max_side, max_side), Image.Resampling.BILINEAR)
+        return img
+
+    def on_table_selection_changed(self, _event: tk.Event) -> None:
+        if self.suppress_table_select_event:
+            return
+        selected_items = self.table.selection()
+        keys = set()
+        for item in selected_items:
+            photo = self.photo_by_item.get(item)
+            if photo is not None:
+                keys.add(photo.key)
+        self.selected_photo_keys = keys
+        if selected_items:
+            first_photo = self.photo_by_item.get(selected_items[0])
+            if first_photo is not None:
+                for idx, photo in enumerate(self.photos):
+                    if photo.key == first_photo.key:
+                        self.selection_anchor_index = idx
+                        break
+        else:
+            self.selection_anchor_index = None
+        self.refresh_gallery_selection_styles()
+        self.update_selection_status()
+
+    def sync_table_selection_from_model(self) -> None:
+        self.suppress_table_select_event = True
+        try:
+            self.table.selection_remove(*self.table.selection())
+            for key in self.selected_photo_keys:
+                item = self.table_item_by_photo_key.get(key)
+                if item:
+                    self.table.selection_add(item)
+            if self.selected_photo_keys:
+                first_key = next(iter(self.selected_photo_keys))
+                first_item = self.table_item_by_photo_key.get(first_key)
+                if first_item:
+                    self.table.see(first_item)
+        finally:
+            self.suppress_table_select_event = False
+
+    def update_selection_status(self) -> None:
+        self.selection_status_var.set(f"Selected: {len(self.selected_photo_keys)}")
 
     def on_browse(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.path_var.get() or str(Path.cwd()))
@@ -696,13 +993,19 @@ class BeRealDownloaderApp:
 
         self.export_dir = export_dir
         self.photos = photos
+        self.selected_photo_keys.clear()
+        self.selection_anchor_index = None
+        self.card_meta_visible_keys.clear()
+        self.show_all_metadata_var.set(False)
 
         self.refresh_table()
         self.refresh_scroller()
+        self.update_selection_status()
         self.status_var.set(f"Loaded {len(self.photos)} memory entries from {export_dir}")
 
     def refresh_table(self) -> None:
         self.photo_by_item.clear()
+        self.table_item_by_photo_key.clear()
         for item in self.table.get_children():
             self.table.delete(item)
 
@@ -736,14 +1039,21 @@ class BeRealDownloaderApp:
                 tags=tuple(tags),
             )
             self.photo_by_item[item_id] = photo
+            self.table_item_by_photo_key[photo.key] = item_id
+
+        self.sync_table_selection_from_model()
 
     def on_download_selected(self) -> None:
-        selected_items = self.table.selection()
-        if not selected_items:
-            messagebox.showinfo("Nothing selected", "Select one or more rows first.")
+        if self.selected_photo_keys:
+            photos = [p for p in self.photos if p.key in self.selected_photo_keys]
+        else:
+            selected_items = self.table.selection()
+            photos = [self.photo_by_item[item] for item in selected_items if item in self.photo_by_item]
+
+        if not photos:
+            messagebox.showinfo("Nothing selected", "Select one or more rows in the table or scroller.")
             return
 
-        photos = [self.photo_by_item[item] for item in selected_items if item in self.photo_by_item]
         self._download_photos(photos)
 
     def on_download_all(self) -> None:

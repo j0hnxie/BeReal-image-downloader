@@ -47,9 +47,9 @@ python bereal_downloader_app.py
 4. Pick a download mode.
 5. Use `Download Selected` or `Download All`.
 6. Rows marked as already downloaded for the selected mode are highlighted.
-7. Use the `Scroller` tab to browse:
-   - `Filename list`: scroll planned output filenames for the selected mode.
-   - `Image preview`: scroll through rendered previews of exactly how each export will look for the selected mode.
+7. Use the `Scroller` tab to browse previews in a vertical grid (1 item per row) and scroll naturally with your trackpad/mouse wheel.
+8. Select in the `Scroller` by clicking cards, and use `Shift+Click` to select ranges. `Download Selected` uses these selections.
+9. Each card has a small `i` button in the top-right of the image to show/hide metadata for that card. Use `Show metadata on all cards` to display metadata for every card at once.
 
 ## Metadata behavior
 
