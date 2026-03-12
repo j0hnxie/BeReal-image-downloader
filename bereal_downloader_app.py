@@ -354,6 +354,7 @@ class BeRealDownloaderApp:
 
         self.photos: List[MemoryPhoto] = []
         self.photo_by_item: Dict[str, MemoryPhoto] = {}
+        self.photo_index_by_key: Dict[str, int] = {}
         self.export_dir: Optional[Path] = None
 
         self.path_var = tk.StringVar(value=str(Path.cwd()))
@@ -370,18 +371,26 @@ class BeRealDownloaderApp:
         self.selection_anchor_index: Optional[int] = None
 
         self.scroller_container: Optional[ttk.Frame] = None
+        self.notebook: Optional[ttk.Notebook] = None
+        self.table_tab: Optional[ttk.Frame] = None
+        self.scroller_tab: Optional[ttk.Frame] = None
+        self.scroller_active: bool = False
         self.gallery_canvas: Optional[tk.Canvas] = None
         self.gallery_inner: Optional[ttk.Frame] = None
         self.gallery_scrollbar: Optional[ttk.Scrollbar] = None
         self.gallery_window_id: Optional[int] = None
         self.gallery_cards: List[Dict] = []
+        self.gallery_card_by_key: Dict[str, Dict] = {}
         self.gallery_thumbnail_refs: Dict[Tuple[str, str], "ImageTk.PhotoImage"] = {}
         self.card_meta_visible_keys: set[str] = set()
         self.thumbnail_job_queue = deque()
         self.thumbnail_job_set: set[int] = set()
         self.thumbnail_job_after_id: Optional[str] = None
         self.thumbnail_request_after_id: Optional[str] = None
+        self.table_selection_after_id: Optional[str] = None
+        self.table_selection_pending_items: Optional[Tuple[str, ...]] = None
         self.last_target_preview_width: int = 0
+        self.scroller_needs_refresh: bool = True
 
         self._build_ui()
         self._configure_row_tags()
@@ -432,12 +441,16 @@ class BeRealDownloaderApp:
 
         notebook = ttk.Notebook(outer)
         notebook.pack(fill=tk.BOTH, expand=True)
+        self.notebook = notebook
 
         table_tab = ttk.Frame(notebook)
         notebook.add(table_tab, text="Selection Table")
+        self.table_tab = table_tab
 
         scroller_tab = ttk.Frame(notebook)
         notebook.add(scroller_tab, text="Scroller")
+        self.scroller_tab = scroller_tab
+        notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
 
         table_frame = ttk.Frame(table_tab)
         table_frame.pack(fill=tk.BOTH, expand=True)
@@ -480,9 +493,47 @@ class BeRealDownloaderApp:
         x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
 
         self._build_scroller_tab(scroller_tab)
+        self.scroller_active = self._is_scroller_tab_active()
 
         status = ttk.Label(outer, textvariable=self.status_var, anchor="w")
         status.pack(fill=tk.X, pady=(8, 0))
+
+    def _is_scroller_tab_active(self) -> bool:
+        if self.notebook is None or self.scroller_tab is None:
+            return False
+        return self.notebook.select() == str(self.scroller_tab)
+
+    def on_notebook_tab_changed(self, _event: tk.Event) -> None:
+        self.scroller_active = self._is_scroller_tab_active()
+        if self.scroller_active:
+            if self.scroller_needs_refresh:
+                self.refresh_scroller()
+            else:
+                self.refresh_gallery_selection_styles()
+                self._schedule_thumbnail_request(1)
+        else:
+            self._clear_scroller_widgets()
+            self.scroller_needs_refresh = True
+
+    def request_scroller_refresh(self) -> None:
+        self.scroller_needs_refresh = True
+        if self.scroller_active:
+            self.refresh_scroller()
+        else:
+            self._clear_scroller_widgets()
+
+    def _clear_scroller_widgets(self) -> None:
+        if self.gallery_inner is None:
+            return
+        self._cancel_thumbnail_loading()
+        for card in self.gallery_cards:
+            self._cancel_card_metadata_job(card)
+        self.gallery_thumbnail_refs.clear()
+        self.gallery_cards.clear()
+        self.gallery_card_by_key.clear()
+        for child in self.gallery_inner.winfo_children():
+            child.destroy()
+        self.update_gallery_scrollregion()
 
     def _build_scroller_tab(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent, padding=(8, 8, 8, 4))
@@ -528,29 +579,27 @@ class BeRealDownloaderApp:
 
     def on_export_mode_changed(self) -> None:
         self.refresh_table()
-        self.refresh_scroller()
+        self.request_scroller_refresh()
 
     def refresh_scroller(self) -> None:
         if self.gallery_inner is None:
             return
 
-        self._cancel_thumbnail_loading()
-        self.gallery_thumbnail_refs.clear()
-        self.gallery_cards.clear()
-
-        for child in self.gallery_inner.winfo_children():
-            child.destroy()
+        self._clear_scroller_widgets()
 
         for idx, photo in enumerate(self.photos):
             card = self._create_gallery_card(idx, photo)
             self.gallery_cards.append(card)
+            self.gallery_card_by_key[photo.key] = card
             self._place_card(card)
 
         self.last_target_preview_width = self._current_target_preview_width()
         self.update_gallery_scrollregion()
-        self._schedule_thumbnail_request(1)
+        if self.scroller_active:
+            self._schedule_thumbnail_request(1)
         self.refresh_gallery_selection_styles()
         self.update_selection_status()
+        self.scroller_needs_refresh = False
 
     def _create_gallery_card(self, idx: int, photo: MemoryPhoto) -> Dict:
         assert self.gallery_inner is not None
@@ -576,30 +625,35 @@ class BeRealDownloaderApp:
         )
         image_label.pack(anchor="center")
 
-        meta_button = tk.Button(
+        meta_button = tk.Canvas(
             image_label,
-            text="i",
-            font=("Helvetica", 10, "bold"),
-            width=1,
-            height=1,
-            padx=3,
-            pady=0,
-            bd=1,
-            relief=tk.SOLID,
+            width=24,
+            height=24,
+            bd=0,
+            highlightthickness=0,
+            bg=META_UI_BG,
             cursor="hand2",
-            command=lambda k=photo.key: self.show_card_metadata(k),
         )
+        meta_button_oval = meta_button.create_oval(1, 1, 23, 23, fill="#000000", outline="#ffffff", width=1)
+        meta_button_text = meta_button.create_text(
+            12,
+            12,
+            text="i",
+            fill="#ffffff",
+            font=("Helvetica", 11, "bold"),
+        )
+        meta_button.bind("<Button-1>", lambda _e, k=photo.key: self.show_card_metadata(k))
         meta_button.place(relx=1.0, x=-6, y=6, anchor="ne")
 
         meta_overlay = tk.Frame(image_label, bg=META_UI_BG, bd=0, highlightthickness=0)
         meta_label = tk.Label(
             meta_overlay,
-            anchor="nw",
-            justify="left",
+            anchor="center",
+            justify="center",
             wraplength=230,
             bg=META_UI_BG,
             fg=META_UI_FG,
-            font=("Helvetica", 11, "bold"),
+            font=("Helvetica", 13, "bold"),
         )
         meta_label.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
@@ -609,9 +663,12 @@ class BeRealDownloaderApp:
             "frame": frame,
             "image_label": image_label,
             "meta_button": meta_button,
+            "meta_button_oval": meta_button_oval,
+            "meta_button_text": meta_button_text,
             "meta_overlay": meta_overlay,
             "meta_label": meta_label,
             "meta_visible": False,
+            "meta_after_id": None,
         }
 
         for widget in (frame, image_label, meta_overlay, meta_label):
@@ -627,24 +684,52 @@ class BeRealDownloaderApp:
         return card
 
     def _populate_card_labels(self, card: Dict) -> None:
-        photo: MemoryPhoto = card["photo"]
         card["image_label"].configure(text="Loading preview...", image="")
-        card["meta_label"].configure(text=self._format_card_metadata(photo), fg=META_UI_FG, bg=META_UI_BG)
+        card["meta_label"].configure(text="", fg=META_UI_FG, bg=META_UI_BG)
+
+    def _set_meta_button_symbol(self, card: Dict, symbol: str) -> None:
+        card["meta_button"].itemconfigure(card["meta_button_text"], text=symbol)
+
+    def _cancel_card_metadata_job(self, card: Dict) -> None:
+        after_id = card.get("meta_after_id")
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            card["meta_after_id"] = None
+
+    def _render_card_metadata(self, card: Dict) -> None:
+        card["meta_after_id"] = None
+        photo: MemoryPhoto = card["photo"]
+        show = self.show_all_metadata_var.get() or (photo.key in self.card_meta_visible_keys)
+        if not show or not card["meta_visible"]:
+            return
+        card["meta_label"].configure(text=self._format_card_metadata(photo))
 
     def _format_card_metadata(self, photo: MemoryPhoto) -> str:
         mode = self.mode_var.get()
         late = "Late" if photo.is_late else "On time"
-        downloaded = "Downloaded" if self.history.has_mode(photo.key, mode) else "New"
+        downloaded = "Already downloaded" if self.history.has_mode(photo.key, mode) else "Not downloaded yet"
         rel = self.exporter.planned_relative_path(photo, mode)
+
         lines = [
-            f"Taken: {self._format_time(photo.taken_time)}",
-            f"Status: {late} | {downloaded}",
-            f"File: {rel}",
+            "Taken",
+            self._format_time_human(photo.taken_time),
+            "",
+            "Status",
+            f"{late} | {downloaded}",
+            "",
+            "Export mode",
+            MODE_LABELS.get(mode, mode),
+            "",
+            "File",
+            Path(rel).name,
         ]
         if photo.caption:
-            lines.append(f"Caption: {photo.caption}")
+            lines.extend(["", "Caption", f'"{photo.caption}"'])
         if photo.location:
-            lines.append(f"Location: {self._format_location(photo.location)}")
+            lines.extend(["", "Location", self._format_location(photo.location)])
         return "\n".join(lines)
 
     def _place_card(self, card: Dict) -> None:
@@ -675,28 +760,26 @@ class BeRealDownloaderApp:
                     relheight=0.82,
                 )
                 card["meta_visible"] = True
-            card["meta_button"].configure(text="×")
-            card["meta_label"].configure(text=self._format_card_metadata(photo))
+            self._set_meta_button_symbol(card, "×")
+            self._cancel_card_metadata_job(card)
+            card["meta_label"].configure(text="Loading metadata...")
+            card["meta_after_id"] = self.root.after(16, lambda c=card: self._render_card_metadata(c))
         else:
+            self._cancel_card_metadata_job(card)
             if card["meta_visible"]:
                 card["meta_overlay"].place_forget()
                 card["meta_visible"] = False
-            card["meta_button"].configure(text="i")
+            self._set_meta_button_symbol(card, "i")
 
     def show_card_metadata(self, photo_key: str) -> None:
-        photo = next((p for p in self.photos if p.key == photo_key), None)
-        if photo is None:
-            return
-
         if photo_key in self.card_meta_visible_keys:
             self.card_meta_visible_keys.remove(photo_key)
         else:
             self.card_meta_visible_keys.add(photo_key)
 
-        for card in self.gallery_cards:
-            if card["photo"].key == photo_key:
-                self.update_card_metadata_visibility(card)
-                break
+        card = self.gallery_card_by_key.get(photo_key)
+        if card is not None:
+            self.update_card_metadata_visibility(card)
         self.update_gallery_scrollregion()
 
     def update_gallery_scrollregion(self) -> None:
@@ -771,6 +854,7 @@ class BeRealDownloaderApp:
         if idx < 0 or idx >= len(self.photos):
             return
 
+        old_keys = set(self.selected_photo_keys)
         shift_down = bool(event.state & 0x0001)
 
         if shift_down and self.selection_anchor_index is not None:
@@ -785,13 +869,23 @@ class BeRealDownloaderApp:
                 self.selected_photo_keys = {clicked_key}
             self.selection_anchor_index = idx
 
-        self.refresh_gallery_selection_styles()
+        self._refresh_gallery_selection_for_keys(old_keys ^ self.selected_photo_keys)
         self.sync_table_selection_from_model()
         self.update_selection_status()
 
     def refresh_gallery_selection_styles(self) -> None:
+        if not self.scroller_active:
+            return
         for card in self.gallery_cards:
             self._apply_gallery_card_style(card)
+
+    def _refresh_gallery_selection_for_keys(self, photo_keys: set[str]) -> None:
+        if not photo_keys or not self.scroller_active:
+            return
+        for key in photo_keys:
+            card = self.gallery_card_by_key.get(key)
+            if card is not None:
+                self._apply_gallery_card_style(card)
 
     def _apply_gallery_card_style(self, card: Dict) -> None:
         photo: MemoryPhoto = card["photo"]
@@ -812,17 +906,13 @@ class BeRealDownloaderApp:
             widget.configure(bg=bg)
         card["meta_overlay"].configure(bg=META_UI_BG)
         card["meta_label"].configure(bg=META_UI_BG, fg=META_UI_FG)
-        card["meta_button"].configure(
-            bg=META_UI_BG,
-            activebackground=META_UI_BG,
-            fg=META_UI_FG,
-            activeforeground=META_UI_FG,
-            highlightthickness=1,
-            highlightbackground=META_UI_FG,
-            highlightcolor=META_UI_FG,
-        )
+        card["meta_button"].configure(bg=META_UI_BG, highlightthickness=0)
+        card["meta_button"].itemconfigure(card["meta_button_oval"], fill="#000000", outline="#ffffff")
+        card["meta_button"].itemconfigure(card["meta_button_text"], fill="#ffffff")
 
     def _schedule_thumbnail_request(self, delay_ms: int = 70) -> None:
+        if not self.scroller_active:
+            return
         if self.thumbnail_request_after_id is not None:
             try:
                 self.root.after_cancel(self.thumbnail_request_after_id)
@@ -835,7 +925,7 @@ class BeRealDownloaderApp:
         self.request_visible_thumbnail_loading()
 
     def request_visible_thumbnail_loading(self) -> None:
-        if not self.gallery_cards or self.gallery_canvas is None:
+        if not self.scroller_active or not self.gallery_cards or self.gallery_canvas is None:
             return
 
         mode = self.mode_var.get()
@@ -965,23 +1055,38 @@ class BeRealDownloaderApp:
     def on_table_selection_changed(self, _event: tk.Event) -> None:
         if self.suppress_table_select_event:
             return
-        selected_items = self.table.selection()
-        keys = set()
+        self.table_selection_pending_items = tuple(self.table.selection())
+        if self.table_selection_after_id is not None:
+            try:
+                self.root.after_cancel(self.table_selection_after_id)
+            except Exception:
+                pass
+        self.table_selection_after_id = self.root.after(24, self._apply_table_selection_change)
+
+    def _apply_table_selection_change(self) -> None:
+        self.table_selection_after_id = None
+        selected_items = self.table_selection_pending_items
+        self.table_selection_pending_items = None
+        if selected_items is None:
+            selected_items = tuple(self.table.selection())
+
+        old_keys = set(self.selected_photo_keys)
+        new_keys: set[str] = set()
         for item in selected_items:
             photo = self.photo_by_item.get(item)
             if photo is not None:
-                keys.add(photo.key)
-        self.selected_photo_keys = keys
+                new_keys.add(photo.key)
+
+        self.selected_photo_keys = new_keys
         if selected_items:
             first_photo = self.photo_by_item.get(selected_items[0])
-            if first_photo is not None:
-                for idx, photo in enumerate(self.photos):
-                    if photo.key == first_photo.key:
-                        self.selection_anchor_index = idx
-                        break
+            self.selection_anchor_index = (
+                self.photo_index_by_key.get(first_photo.key) if first_photo is not None else None
+            )
         else:
             self.selection_anchor_index = None
-        self.refresh_gallery_selection_styles()
+
+        self._refresh_gallery_selection_for_keys(old_keys ^ new_keys)
         self.update_selection_status()
 
     def on_table_double_click(self, event: tk.Event) -> None:
@@ -1039,13 +1144,23 @@ class BeRealDownloaderApp:
     def sync_table_selection_from_model(self) -> None:
         self.suppress_table_select_event = True
         try:
-            self.table.selection_remove(*self.table.selection())
-            for key in self.selected_photo_keys:
-                item = self.table_item_by_photo_key.get(key)
-                if item:
-                    self.table.selection_add(item)
+            current = set(self.table.selection())
+            target = {
+                self.table_item_by_photo_key[k]
+                for k in self.selected_photo_keys
+                if k in self.table_item_by_photo_key
+            }
+            to_remove = tuple(current - target)
+            to_add = tuple(target - current)
+            if to_remove:
+                self.table.selection_remove(*to_remove)
+            if to_add:
+                self.table.selection_add(*to_add)
             if self.selected_photo_keys:
-                first_key = next(iter(self.selected_photo_keys))
+                first_key = min(
+                    self.selected_photo_keys,
+                    key=lambda k: self.photo_index_by_key.get(k, len(self.photos) + 1),
+                )
                 first_item = self.table_item_by_photo_key.get(first_key)
                 if first_item:
                     self.table.see(first_item)
@@ -1084,13 +1199,22 @@ class BeRealDownloaderApp:
         self.show_all_metadata_var.set(False)
 
         self.refresh_table()
-        self.refresh_scroller()
+        self.request_scroller_refresh()
         self.update_selection_status()
         self.status_var.set(f"Loaded {len(self.photos)} memory entries from {export_dir}")
 
     def refresh_table(self) -> None:
+        if self.table_selection_after_id is not None:
+            try:
+                self.root.after_cancel(self.table_selection_after_id)
+            except Exception:
+                pass
+            self.table_selection_after_id = None
+        self.table_selection_pending_items = None
+
         self.photo_by_item.clear()
         self.table_item_by_photo_key.clear()
+        self.photo_index_by_key = {photo.key: idx for idx, photo in enumerate(self.photos)}
         for item in self.table.get_children():
             self.table.delete(item)
 
@@ -1175,7 +1299,7 @@ class BeRealDownloaderApp:
 
         self.history.save()
         self.refresh_table()
-        self.refresh_scroller()
+        self.request_scroller_refresh()
 
         summary = f"Done. Success: {succeeded}, Skipped: {skipped}, Failed: {failed}"
         self.status_var.set(summary)
@@ -1205,6 +1329,17 @@ class BeRealDownloaderApp:
         try:
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
             return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return value
+
+    @staticmethod
+    def _format_time_human(value: str) -> str:
+        if not value:
+            return "Unknown capture time"
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+            hour = dt.strftime("%I").lstrip("0") or "0"
+            return f"{dt.strftime('%B %d, %Y')} at {hour}:{dt.strftime('%M:%S %p')}"
         except ValueError:
             return value
 
