@@ -43,6 +43,8 @@ CARD_BG_DEFAULT = "#e9ecef"
 CARD_BG_SELECTED = "#cfe8ff"
 CARD_BG_MISSING = "#ffe9e9"
 CARD_BG_DOWNLOADED = "#e9f8ee"
+META_UI_BG = "#000000"
+META_UI_FG = "#ffffff"
 
 
 @dataclass
@@ -471,6 +473,7 @@ class BeRealDownloaderApp:
         x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.table.xview)
         self.table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
         self.table.bind("<<TreeviewSelect>>", self.on_table_selection_changed)
+        self.table.bind("<Double-1>", self.on_table_double_click)
 
         self.table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -576,19 +579,29 @@ class BeRealDownloaderApp:
         meta_button = tk.Button(
             image_label,
             text="i",
-            font=("Helvetica", 8, "bold"),
+            font=("Helvetica", 10, "bold"),
             width=1,
             height=1,
-            padx=2,
+            padx=3,
             pady=0,
-            bd=0,
-            relief=tk.FLAT,
+            bd=1,
+            relief=tk.SOLID,
             cursor="hand2",
             command=lambda k=photo.key: self.show_card_metadata(k),
         )
         meta_button.place(relx=1.0, x=-6, y=6, anchor="ne")
 
-        meta_label = tk.Label(frame, anchor="w", justify="left", wraplength=230)
+        meta_overlay = tk.Frame(image_label, bg=META_UI_BG, bd=0, highlightthickness=0)
+        meta_label = tk.Label(
+            meta_overlay,
+            anchor="nw",
+            justify="left",
+            wraplength=230,
+            bg=META_UI_BG,
+            fg=META_UI_FG,
+            font=("Helvetica", 11, "bold"),
+        )
+        meta_label.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
         card = {
             "index": idx,
@@ -596,11 +609,12 @@ class BeRealDownloaderApp:
             "frame": frame,
             "image_label": image_label,
             "meta_button": meta_button,
+            "meta_overlay": meta_overlay,
             "meta_label": meta_label,
             "meta_visible": False,
         }
 
-        for widget in (frame, image_label, meta_label):
+        for widget in (frame, image_label, meta_overlay, meta_label):
             widget.bind("<Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e))
             widget.bind("<Shift-Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e))
             widget.bind("<MouseWheel>", self.on_gallery_mouse_wheel)
@@ -615,7 +629,7 @@ class BeRealDownloaderApp:
     def _populate_card_labels(self, card: Dict) -> None:
         photo: MemoryPhoto = card["photo"]
         card["image_label"].configure(text="Loading preview...", image="")
-        card["meta_label"].configure(text=self._format_card_metadata(photo), fg="#111111")
+        card["meta_label"].configure(text=self._format_card_metadata(photo), fg=META_UI_FG, bg=META_UI_BG)
 
     def _format_card_metadata(self, photo: MemoryPhoto) -> str:
         mode = self.mode_var.get()
@@ -649,17 +663,23 @@ class BeRealDownloaderApp:
     def update_card_metadata_visibility(self, card: Dict) -> None:
         photo: MemoryPhoto = card["photo"]
         show = self.show_all_metadata_var.get() or (photo.key in self.card_meta_visible_keys)
-        card["meta_label"].configure(wraplength=max(260, self._current_target_preview_width() - 30))
+        card["meta_label"].configure(wraplength=max(260, self._current_target_preview_width() - 80))
 
         if show:
             if not card["meta_visible"]:
-                card["meta_label"].pack(fill=tk.X, pady=(4, 0))
+                card["meta_overlay"].place(
+                    relx=0.5,
+                    rely=0.5,
+                    anchor="center",
+                    relwidth=0.92,
+                    relheight=0.82,
+                )
                 card["meta_visible"] = True
             card["meta_button"].configure(text="×")
             card["meta_label"].configure(text=self._format_card_metadata(photo))
         else:
             if card["meta_visible"]:
-                card["meta_label"].pack_forget()
+                card["meta_overlay"].place_forget()
                 card["meta_visible"] = False
             card["meta_button"].configure(text="i")
 
@@ -686,12 +706,12 @@ class BeRealDownloaderApp:
 
     def _current_target_preview_width(self) -> int:
         if self.gallery_canvas is None:
-            return 960
+            return 760
         canvas_w = self.gallery_canvas.winfo_width()
         if canvas_w <= 1:
-            return 960
-        # One card per row with small horizontal margin.
-        return min(1700, max(640, canvas_w - 28))
+            return 760
+        # One card per row, intentionally smaller than full width.
+        return min(980, max(560, canvas_w - 220))
 
     def _handle_preview_width_change(self) -> None:
         new_width = self._current_target_preview_width()
@@ -729,14 +749,22 @@ class BeRealDownloaderApp:
 
         step = 0
         if hasattr(event, "delta") and event.delta:
-            step = -1 if event.delta > 0 else 1
+            if sys.platform == "darwin":
+                step = int(-event.delta)
+                if step == 0:
+                    step = -1 if event.delta > 0 else 1
+                step = max(-3, min(3, step))
+            else:
+                step = int(-event.delta / 120)
+                if step == 0:
+                    step = -1 if event.delta > 0 else 1
         elif getattr(event, "num", None) == 4:
             step = -1
         elif getattr(event, "num", None) == 5:
             step = 1
 
         if step != 0:
-            self.gallery_canvas.yview_scroll(step * 10, "units")
+            self.gallery_canvas.yview_scroll(step * 2, "units")
             self._schedule_thumbnail_request()
 
     def on_gallery_item_click(self, idx: int, event: tk.Event) -> None:
@@ -780,16 +808,21 @@ class BeRealDownloaderApp:
         else:
             bg = CARD_BG_DEFAULT
 
-        for widget in (card["frame"], card["image_label"], card["meta_label"]):
+        for widget in (card["frame"], card["image_label"]):
             widget.configure(bg=bg)
+        card["meta_overlay"].configure(bg=META_UI_BG)
+        card["meta_label"].configure(bg=META_UI_BG, fg=META_UI_FG)
         card["meta_button"].configure(
-            bg=bg,
-            activebackground=bg,
-            fg="#1f4f7a" if not selected else "#0a2d4a",
-            activeforeground="#0a2d4a",
+            bg=META_UI_BG,
+            activebackground=META_UI_BG,
+            fg=META_UI_FG,
+            activeforeground=META_UI_FG,
+            highlightthickness=1,
+            highlightbackground=META_UI_FG,
+            highlightcolor=META_UI_FG,
         )
 
-    def _schedule_thumbnail_request(self, delay_ms: int = 40) -> None:
+    def _schedule_thumbnail_request(self, delay_ms: int = 70) -> None:
         if self.thumbnail_request_after_id is not None:
             try:
                 self.root.after_cancel(self.thumbnail_request_after_id)
@@ -842,7 +875,7 @@ class BeRealDownloaderApp:
             return
 
         mode = self.mode_var.get()
-        batch_size = 8
+        batch_size = 6
         for _ in range(batch_size):
             if not self.thumbnail_job_queue:
                 break
@@ -869,7 +902,7 @@ class BeRealDownloaderApp:
                 card["image_label"].image = None
 
         if self.thumbnail_job_queue:
-            self.thumbnail_job_after_id = self.root.after(8, self._process_thumbnail_batch)
+            self.thumbnail_job_after_id = self.root.after(12, self._process_thumbnail_batch)
         else:
             self.thumbnail_job_after_id = None
 
@@ -950,6 +983,58 @@ class BeRealDownloaderApp:
             self.selection_anchor_index = None
         self.refresh_gallery_selection_styles()
         self.update_selection_status()
+
+    def on_table_double_click(self, event: tk.Event) -> None:
+        item = self.table.identify_row(event.y)
+        if not item:
+            selected = self.table.selection()
+            item = selected[0] if selected else ""
+        if not item:
+            return
+
+        photo = self.photo_by_item.get(item)
+        if photo is None:
+            return
+        self.open_photo_preview_window(photo)
+
+    def open_photo_preview_window(self, photo: MemoryPhoto) -> None:
+        if not photo.front_path.exists() or not photo.back_path.exists():
+            messagebox.showerror("Preview unavailable", "Source image files are missing for this row.")
+            return
+
+        mode = self.mode_var.get()
+        try:
+            img = self.exporter.render_output_image(photo, mode)
+        except Exception as exc:
+            messagebox.showerror("Preview failed", str(exc))
+            return
+
+        max_w = int(self.root.winfo_screenwidth() * 0.82)
+        max_h = int(self.root.winfo_screenheight() * 0.82)
+        if img.width > max_w or img.height > max_h:
+            scale = min(max_w / img.width, max_h / img.height)
+            img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.Resampling.LANCZOS)
+
+        photo_img = ImageTk.PhotoImage(img)
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Export Preview - {MODE_LABELS.get(mode, mode)}")
+        win.configure(bg="#000000")
+
+        image_label = tk.Label(win, image=photo_img, bg="#000000", bd=0, highlightthickness=0)
+        image_label.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+
+        info = f"{self._format_time(photo.taken_time)}  |  {MODE_LABELS.get(mode, mode)}"
+        info_label = tk.Label(
+            win,
+            text=info,
+            bg="#000000",
+            fg="#ffffff",
+            font=("Helvetica", 11, "bold"),
+        )
+        info_label.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        win.preview_photo = photo_img
 
     def sync_table_selection_from_model(self) -> None:
         self.suppress_table_select_event = True
