@@ -15,10 +15,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 try:
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageOps, ImageTk
 except Exception:  # pragma: no cover - runtime environment dependent
     Image = None
     ImageOps = None
+    ImageTk = None
 
 APP_TITLE = "BeReal Image Downloader"
 APP_WIDTH = 1300
@@ -35,6 +36,9 @@ MODE_LABELS = {
     MODE_BEREAL_FRONT_TL: "BeReal style (front top-left)",
     MODE_BEREAL_BACK_TL: "BeReal style (back top-left)",
 }
+
+BROWSER_FILENAME = "filename"
+BROWSER_PREVIEW = "preview"
 
 
 @dataclass
@@ -198,19 +202,7 @@ class ImageExporter:
         if not photo.back_path.exists():
             raise FileNotFoundError(f"Back image not found: {photo.back_path}")
 
-        front = self._load_image(photo.front_path)
-        back = self._load_image(photo.back_path)
-
-        if mode == MODE_FRONT_ONLY:
-            output_img = front
-        elif mode == MODE_BACK_ONLY:
-            output_img = back
-        elif mode == MODE_BEREAL_FRONT_TL:
-            output_img = self._compose(base=back, inset=front)
-        elif mode == MODE_BEREAL_BACK_TL:
-            output_img = self._compose(base=front, inset=back)
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
+        output_img = self.render_output_image(photo, mode)
 
         output_path = self._build_output_path(photo, mode)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +243,38 @@ class ImageExporter:
 
         return output_path, sidecar_path
 
+    def render_output_image(self, photo: MemoryPhoto, mode: str) -> "Image.Image":
+        if Image is None or ImageOps is None:
+            raise RuntimeError("Pillow is not installed. Run: pip install -r requirements.txt")
+
+        front = self._load_image(photo.front_path)
+        back = self._load_image(photo.back_path)
+
+        if mode == MODE_FRONT_ONLY:
+            return front
+        if mode == MODE_BACK_ONLY:
+            return back
+        if mode == MODE_BEREAL_FRONT_TL:
+            return self._compose(base=back, inset=front)
+        if mode == MODE_BEREAL_BACK_TL:
+            return self._compose(base=front, inset=back)
+
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    def planned_relative_path(self, photo: MemoryPhoto, mode: str) -> Path:
+        taken_dt = self._parse_iso(photo.taken_time) or datetime.now(timezone.utc)
+        local_dt = taken_dt.astimezone()
+        year_dir = local_dt.strftime("%Y")
+        day_dir = local_dt.strftime("%Y-%m-%d")
+        filename = self.planned_filename(photo, mode)
+        return Path(year_dir) / day_dir / filename
+
+    def planned_filename(self, photo: MemoryPhoto, mode: str) -> str:
+        taken_dt = self._parse_iso(photo.taken_time) or datetime.now(timezone.utc)
+        local_dt = taken_dt.astimezone()
+        stamp = local_dt.strftime("%Y%m%d_%H%M%S")
+        return f"{stamp}_{mode}.jpg"
+
     @staticmethod
     def _load_image(path: Path) -> "Image.Image":
         img = Image.open(path)
@@ -278,21 +302,15 @@ class ImageExporter:
         return composed
 
     def _build_output_path(self, photo: MemoryPhoto, mode: str) -> Path:
-        taken_dt = self._parse_iso(photo.taken_time) or datetime.now(timezone.utc)
-        local_dt = taken_dt.astimezone()
-
-        year_dir = local_dt.strftime("%Y")
-        day_dir = local_dt.strftime("%Y-%m-%d")
-        stamp = local_dt.strftime("%Y%m%d_%H%M%S")
-        filename = f"{stamp}_{mode}.jpg"
-
-        base_path = self.downloads_root / year_dir / day_dir / filename
+        relative = self.planned_relative_path(photo, mode)
+        base_path = self.downloads_root / relative
         if not base_path.exists():
             return base_path
 
+        stem = base_path.stem
         suffix = 2
         while True:
-            candidate = base_path.with_name(f"{stamp}_{mode}_{suffix}.jpg")
+            candidate = base_path.with_name(f"{stem}_{suffix}.jpg")
             if not candidate.exists():
                 return candidate
             suffix += 1
@@ -334,8 +352,21 @@ class BeRealDownloaderApp:
 
         self.path_var = tk.StringVar(value=str(Path.cwd()))
         self.mode_var = tk.StringVar(value=MODE_BEREAL_FRONT_TL)
+        self.browser_mode_var = tk.StringVar(value=BROWSER_FILENAME)
+        self.preview_index_var = tk.IntVar(value=1)
         self.skip_existing_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Select an export folder and click Load Data.")
+
+        self.filename_listbox: Optional[tk.Listbox] = None
+        self.preview_frame: Optional[ttk.Frame] = None
+        self.filename_frame: Optional[ttk.Frame] = None
+        self.preview_image_label: Optional[ttk.Label] = None
+        self.preview_meta_var = tk.StringVar(value="")
+        self.preview_filename_var = tk.StringVar(value="")
+        self.preview_index_label_var = tk.StringVar(value="0 / 0")
+        self.preview_scale: Optional[ttk.Scale] = None
+        self.preview_photo_image = None
+        self.preview_updating = False
 
         self._build_ui()
         self._configure_row_tags()
@@ -363,7 +394,7 @@ class BeRealDownloaderApp:
                 text=label,
                 value=mode,
                 variable=self.mode_var,
-                command=self.refresh_table,
+                command=self.on_export_mode_changed,
             ).pack(side=tk.LEFT, padx=(0, 18))
 
         action_frame = ttk.Frame(outer)
@@ -383,7 +414,16 @@ class BeRealDownloaderApp:
             side=tk.RIGHT, padx=(0, 6)
         )
 
-        table_frame = ttk.Frame(outer)
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        table_tab = ttk.Frame(notebook)
+        notebook.add(table_tab, text="Selection Table")
+
+        scroller_tab = ttk.Frame(notebook)
+        notebook.add(scroller_tab, text="Scroller")
+
+        table_frame = ttk.Frame(table_tab)
         table_frame.pack(fill=tk.BOTH, expand=True)
 
         columns = (
@@ -421,12 +461,217 @@ class BeRealDownloaderApp:
         y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
 
+        self._build_scroller_tab(scroller_tab)
+
         status = ttk.Label(outer, textvariable=self.status_var, anchor="w")
         status.pack(fill=tk.X, pady=(8, 0))
+
+    def _build_scroller_tab(self, parent: ttk.Frame) -> None:
+        top = ttk.Frame(parent, padding=(8, 8, 8, 4))
+        top.pack(fill=tk.X)
+
+        ttk.Label(top, text="Browse style:").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(
+            top,
+            text="Filename list",
+            value=BROWSER_FILENAME,
+            variable=self.browser_mode_var,
+            command=self.on_browser_mode_changed,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Radiobutton(
+            top,
+            text="Image preview",
+            value=BROWSER_PREVIEW,
+            variable=self.browser_mode_var,
+            command=self.on_browser_mode_changed,
+        ).pack(side=tk.LEFT)
+
+        container = ttk.Frame(parent, padding=(8, 4, 8, 8))
+        container.pack(fill=tk.BOTH, expand=True)
+
+        self.filename_frame = ttk.Frame(container)
+        self.preview_frame = ttk.Frame(container)
+
+        self._build_filename_browser(self.filename_frame)
+        self._build_preview_browser(self.preview_frame)
+
+        self.on_browser_mode_changed()
+
+    def _build_filename_browser(self, parent: ttk.Frame) -> None:
+        parent.pack(fill=tk.BOTH, expand=True)
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.filename_listbox = tk.Listbox(
+            list_frame,
+            activestyle="none",
+            selectmode=tk.SINGLE,
+            font=("Menlo", 11) if sys.platform == "darwin" else ("Courier", 10),
+        )
+        y_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.filename_listbox.yview)
+        self.filename_listbox.configure(yscrollcommand=y_scroll.set)
+
+        self.filename_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _build_preview_browser(self, parent: ttk.Frame) -> None:
+        parent.pack(fill=tk.BOTH, expand=True)
+
+        nav = ttk.Frame(parent)
+        nav.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(nav, text="Previous", command=self.on_preview_previous).pack(side=tk.LEFT)
+        ttk.Button(nav, text="Next", command=self.on_preview_next).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(nav, textvariable=self.preview_index_label_var).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Label(nav, text="Scroll bar:").pack(side=tk.LEFT, padx=(0, 8))
+
+        self.preview_scale = ttk.Scale(nav, from_=1, to=1, command=self.on_preview_scale_changed)
+        self.preview_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        canvas_holder = ttk.Frame(parent)
+        canvas_holder.pack(fill=tk.BOTH, expand=True)
+
+        self.preview_image_label = ttk.Label(canvas_holder, anchor="center")
+        self.preview_image_label.pack(fill=tk.BOTH, expand=True)
+        self.preview_image_label.bind("<MouseWheel>", self.on_preview_mouse_wheel)
+        self.preview_image_label.bind("<Button-4>", self.on_preview_mouse_wheel)
+        self.preview_image_label.bind("<Button-5>", self.on_preview_mouse_wheel)
+
+        ttk.Label(parent, textvariable=self.preview_filename_var, anchor="w").pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(parent, textvariable=self.preview_meta_var, anchor="w").pack(fill=tk.X, pady=(2, 0))
 
     def _configure_row_tags(self) -> None:
         self.table.tag_configure("missing", background="#ffe9e9")
         self.table.tag_configure("downloaded_mode", background="#e9f8ee")
+
+    def on_export_mode_changed(self) -> None:
+        self.refresh_table()
+        self.refresh_scroller()
+
+    def on_browser_mode_changed(self) -> None:
+        if self.filename_frame is None or self.preview_frame is None:
+            return
+
+        self.filename_frame.pack_forget()
+        self.preview_frame.pack_forget()
+
+        if self.browser_mode_var.get() == BROWSER_PREVIEW:
+            self.preview_frame.pack(fill=tk.BOTH, expand=True)
+            self.refresh_preview_panel()
+        else:
+            self.filename_frame.pack(fill=tk.BOTH, expand=True)
+
+    def refresh_scroller(self) -> None:
+        self.refresh_filename_browser()
+        if self.preview_scale is not None:
+            max_value = max(1, len(self.photos))
+            self.preview_scale.configure(from_=1, to=max_value)
+        if len(self.photos) == 0:
+            self.preview_index_var.set(1)
+        else:
+            self.preview_index_var.set(min(max(self.preview_index_var.get(), 1), len(self.photos)))
+        self.refresh_preview_panel()
+
+    def refresh_filename_browser(self) -> None:
+        if self.filename_listbox is None:
+            return
+
+        self.filename_listbox.delete(0, tk.END)
+        mode = self.mode_var.get()
+
+        for idx, photo in enumerate(self.photos, start=1):
+            rel = self.exporter.planned_relative_path(photo, mode)
+            downloaded = "downloaded" if self.history.has_mode(photo.key, mode) else "new"
+            line = f"{idx:04d}  {rel}  [{downloaded}]"
+            self.filename_listbox.insert(tk.END, line)
+
+        if self.photos:
+            self.filename_listbox.selection_set(0)
+            self.filename_listbox.see(0)
+
+    def on_preview_previous(self) -> None:
+        self.set_preview_index(self.preview_index_var.get() - 1)
+
+    def on_preview_next(self) -> None:
+        self.set_preview_index(self.preview_index_var.get() + 1)
+
+    def on_preview_scale_changed(self, value: str) -> None:
+        if self.preview_updating:
+            return
+        try:
+            index = int(float(value))
+        except ValueError:
+            return
+        self.set_preview_index(index)
+
+    def on_preview_mouse_wheel(self, event: tk.Event) -> None:
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = -1 if event.delta > 0 else 1
+        elif getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+
+        if delta != 0:
+            self.set_preview_index(self.preview_index_var.get() + delta)
+
+    def set_preview_index(self, one_based_index: int) -> None:
+        if not self.photos:
+            self.preview_index_var.set(1)
+            self.refresh_preview_panel()
+            return
+
+        clamped = min(max(one_based_index, 1), len(self.photos))
+        self.preview_index_var.set(clamped)
+        self.refresh_preview_panel()
+
+    def refresh_preview_panel(self) -> None:
+        total = len(self.photos)
+        current = self.preview_index_var.get()
+
+        if total == 0:
+            self.preview_index_label_var.set("0 / 0")
+            self.preview_filename_var.set("")
+            self.preview_meta_var.set("No photos loaded")
+            if self.preview_image_label is not None:
+                self.preview_image_label.configure(image="", text="")
+            return
+
+        current = min(max(current, 1), total)
+        self.preview_index_var.set(current)
+        self.preview_index_label_var.set(f"{current} / {total}")
+
+        if self.preview_scale is not None:
+            self.preview_updating = True
+            try:
+                self.preview_scale.set(current)
+            finally:
+                self.preview_updating = False
+
+        photo = self.photos[current - 1]
+        mode = self.mode_var.get()
+        rel = self.exporter.planned_relative_path(photo, mode)
+        self.preview_filename_var.set(str(rel))
+
+        late = "Late" if photo.is_late else "On time"
+        downloaded = "Downloaded for this mode" if self.history.has_mode(photo.key, mode) else "Not downloaded"
+        self.preview_meta_var.set(f"{self._format_time(photo.taken_time)} | {late} | {downloaded}")
+
+        if self.preview_image_label is None:
+            return
+
+        if not photo.front_path.exists() or not photo.back_path.exists():
+            self.preview_image_label.configure(image="", text="Source image missing")
+            return
+
+        try:
+            preview = self.exporter.render_output_image(photo, mode)
+            preview.thumbnail((900, 430), Image.Resampling.LANCZOS)
+            self.preview_photo_image = ImageTk.PhotoImage(preview)
+            self.preview_image_label.configure(image=self.preview_photo_image, text="")
+        except Exception as exc:
+            self.preview_image_label.configure(image="", text=f"Preview error: {exc}")
 
     def on_browse(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.path_var.get() or str(Path.cwd()))
@@ -434,7 +679,7 @@ class BeRealDownloaderApp:
             self.path_var.set(selected)
 
     def on_load_data(self) -> None:
-        if Image is None or ImageOps is None:
+        if Image is None or ImageOps is None or ImageTk is None:
             messagebox.showerror(
                 "Missing dependency",
                 "Pillow is required. Install it with:\n\npython3 -m pip install -r requirements.txt",
@@ -453,6 +698,7 @@ class BeRealDownloaderApp:
         self.photos = photos
 
         self.refresh_table()
+        self.refresh_scroller()
         self.status_var.set(f"Loaded {len(self.photos)} memory entries from {export_dir}")
 
     def refresh_table(self) -> None:
@@ -534,6 +780,7 @@ class BeRealDownloaderApp:
 
         self.history.save()
         self.refresh_table()
+        self.refresh_scroller()
 
         summary = f"Done. Success: {succeeded}, Skipped: {skipped}, Failed: {failed}"
         self.status_var.set(summary)

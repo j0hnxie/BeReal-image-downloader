@@ -47,6 +47,9 @@ python bereal_downloader_app.py
 4. Pick a download mode.
 5. Use `Download Selected` or `Download All`.
 6. Rows marked as already downloaded for the selected mode are highlighted.
+7. Use the `Scroller` tab to browse:
+   - `Filename list`: scroll planned output filenames for the selected mode.
+   - `Image preview`: scroll through rendered previews of exactly how each export will look for the selected mode.
 
 ## Metadata behavior
 
