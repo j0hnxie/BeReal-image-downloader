@@ -185,6 +185,15 @@ class HistoryStore:
     def downloaded_modes(self, photo_key: str) -> List[str]:
         return sorted(self._data.get("entries", {}).get(photo_key, {}).keys())
 
+    def get_output_path(self, photo_key: str, mode: str) -> Optional[Path]:
+        entry = self._data.get("entries", {}).get(photo_key, {}).get(mode)
+        if not isinstance(entry, dict):
+            return None
+        output_raw = entry.get("outputPath")
+        if not isinstance(output_raw, str) or not output_raw:
+            return None
+        return Path(output_raw)
+
     def mark_download(self, photo_key: str, mode: str, output_path: Path, sidecar_path: Path) -> None:
         entries = self._data.setdefault("entries", {})
         record = entries.setdefault(photo_key, {})
@@ -512,15 +521,12 @@ class BeRealDownloaderApp:
                 self.refresh_gallery_selection_styles()
                 self._schedule_thumbnail_request(1)
         else:
-            self._clear_scroller_widgets()
-            self.scroller_needs_refresh = True
+            self._cancel_thumbnail_loading()
 
     def request_scroller_refresh(self) -> None:
         self.scroller_needs_refresh = True
         if self.scroller_active:
             self.refresh_scroller()
-        else:
-            self._clear_scroller_widgets()
 
     def _clear_scroller_widgets(self) -> None:
         if self.gallery_inner is None:
@@ -1014,25 +1020,37 @@ class BeRealDownloaderApp:
 
     def _build_thumbnail(self, photo: MemoryPhoto, mode: str) -> Optional["ImageTk.PhotoImage"]:
         try:
-            if not photo.front_path.exists() or not photo.back_path.exists():
-                return None
             target_w = self._current_target_preview_width()
             source_max_side = min(2600, max(1200, target_w * 2))
+            downloaded_output = self.history.get_output_path(photo.key, mode)
 
-            if mode == MODE_FRONT_ONLY:
-                img = self._open_preview_image(photo.front_path, source_max_side)
-            elif mode == MODE_BACK_ONLY:
-                img = self._open_preview_image(photo.back_path, source_max_side)
-            elif mode == MODE_BEREAL_FRONT_TL:
-                base = self._open_preview_image(photo.back_path, source_max_side)
-                inset = self._open_preview_image(photo.front_path, max(700, int(source_max_side * 0.58)))
-                img = ImageExporter._compose(base=base, inset=inset)
-            elif mode == MODE_BEREAL_BACK_TL:
-                base = self._open_preview_image(photo.front_path, source_max_side)
-                inset = self._open_preview_image(photo.back_path, max(700, int(source_max_side * 0.58)))
-                img = ImageExporter._compose(base=base, inset=inset)
+            if downloaded_output is not None and downloaded_output.exists():
+                img = self._open_preview_image(downloaded_output, source_max_side)
             else:
-                img = self._open_preview_image(photo.front_path, source_max_side)
+                if mode == MODE_FRONT_ONLY:
+                    if not photo.front_path.exists():
+                        return None
+                    img = self._open_preview_image(photo.front_path, source_max_side)
+                elif mode == MODE_BACK_ONLY:
+                    if not photo.back_path.exists():
+                        return None
+                    img = self._open_preview_image(photo.back_path, source_max_side)
+                elif mode == MODE_BEREAL_FRONT_TL:
+                    if not photo.front_path.exists() or not photo.back_path.exists():
+                        return None
+                    base = self._open_preview_image(photo.back_path, source_max_side)
+                    inset = self._open_preview_image(photo.front_path, max(700, int(source_max_side * 0.58)))
+                    img = ImageExporter._compose(base=base, inset=inset)
+                elif mode == MODE_BEREAL_BACK_TL:
+                    if not photo.front_path.exists() or not photo.back_path.exists():
+                        return None
+                    base = self._open_preview_image(photo.front_path, source_max_side)
+                    inset = self._open_preview_image(photo.back_path, max(700, int(source_max_side * 0.58)))
+                    img = ImageExporter._compose(base=base, inset=inset)
+                else:
+                    if not photo.front_path.exists():
+                        return None
+                    img = self._open_preview_image(photo.front_path, source_max_side)
 
             if img.width > 0 and img.width != target_w:
                 target_h = max(1, int(img.height * (target_w / img.width)))
@@ -1043,12 +1061,12 @@ class BeRealDownloaderApp:
 
     @staticmethod
     def _open_preview_image(path: Path, max_side: int) -> "Image.Image":
-        img = Image.open(path)
-        try:
-            img.draft("RGB", (max_side, max_side))
-        except Exception:
-            pass
-        img = ImageOps.exif_transpose(img).convert("RGB")
+        with Image.open(path) as source:
+            try:
+                source.draft("RGB", (max_side, max_side))
+            except Exception:
+                pass
+            img = ImageOps.exif_transpose(source).convert("RGB")
         img.thumbnail((max_side, max_side), Image.Resampling.BILINEAR)
         return img
 
@@ -1103,13 +1121,17 @@ class BeRealDownloaderApp:
         self.open_photo_preview_window(photo)
 
     def open_photo_preview_window(self, photo: MemoryPhoto) -> None:
-        if not photo.front_path.exists() or not photo.back_path.exists():
-            messagebox.showerror("Preview unavailable", "Source image files are missing for this row.")
-            return
-
         mode = self.mode_var.get()
         try:
-            img = self.exporter.render_output_image(photo, mode)
+            downloaded_output = self.history.get_output_path(photo.key, mode)
+            if downloaded_output is not None and downloaded_output.exists():
+                with Image.open(downloaded_output) as source:
+                    img = ImageOps.exif_transpose(source).convert("RGB")
+            else:
+                if not photo.front_path.exists() or not photo.back_path.exists():
+                    messagebox.showerror("Preview unavailable", "Source image files are missing for this row.")
+                    return
+                img = self.exporter.render_output_image(photo, mode)
         except Exception as exc:
             messagebox.showerror("Preview failed", str(exc))
             return
