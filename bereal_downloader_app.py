@@ -378,6 +378,7 @@ class BeRealDownloaderApp:
 
         self.selected_photo_keys: set[str] = set()
         self.selection_anchor_index: Optional[int] = None
+        self.selection_focus_index: Optional[int] = None
 
         self.scroller_container: Optional[ttk.Frame] = None
         self.notebook: Optional[ttk.Notebook] = None
@@ -400,6 +401,8 @@ class BeRealDownloaderApp:
         self.table_selection_pending_items: Optional[Tuple[str, ...]] = None
         self.last_target_preview_width: int = 0
         self.scroller_needs_refresh: bool = True
+        self.preview_window: Optional[tk.Toplevel] = None
+        self.preview_signature: Optional[Tuple[str, str]] = None
 
         self._build_ui()
         self._configure_row_tags()
@@ -496,6 +499,11 @@ class BeRealDownloaderApp:
         self.table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
         self.table.bind("<<TreeviewSelect>>", self.on_table_selection_changed)
         self.table.bind("<Double-1>", self.on_table_double_click)
+        self.table.bind("<space>", self.on_space_toggle_preview)
+        self.table.bind("<Up>", self.on_table_arrow_key)
+        self.table.bind("<Down>", self.on_table_arrow_key)
+        self.table.bind("<Command-a>", self.on_select_all_shortcut)
+        self.table.bind("<Control-a>", self.on_select_all_shortcut)
 
         self.table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -578,6 +586,11 @@ class BeRealDownloaderApp:
         self.gallery_canvas.bind("<MouseWheel>", self.on_gallery_mouse_wheel)
         self.gallery_canvas.bind("<Button-4>", self.on_gallery_mouse_wheel)
         self.gallery_canvas.bind("<Button-5>", self.on_gallery_mouse_wheel)
+        self.gallery_canvas.bind("<space>", self.on_space_toggle_preview)
+        self.gallery_canvas.bind("<Up>", self.on_scroller_arrow_key)
+        self.gallery_canvas.bind("<Down>", self.on_scroller_arrow_key)
+        self.gallery_canvas.bind("<Command-a>", self.on_select_all_shortcut)
+        self.gallery_canvas.bind("<Control-a>", self.on_select_all_shortcut)
 
     def _configure_row_tags(self) -> None:
         self.table.tag_configure("missing", background="#ffe9e9")
@@ -680,6 +693,8 @@ class BeRealDownloaderApp:
         for widget in (frame, image_label, meta_overlay, meta_label):
             widget.bind("<Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e))
             widget.bind("<Shift-Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e))
+            widget.bind("<Command-Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e, "toggle"))
+            widget.bind("<Control-Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e, "toggle"))
             widget.bind("<MouseWheel>", self.on_gallery_mouse_wheel)
             widget.bind("<Button-4>", self.on_gallery_mouse_wheel)
             widget.bind("<Button-5>", self.on_gallery_mouse_wheel)
@@ -856,28 +871,154 @@ class BeRealDownloaderApp:
             self.gallery_canvas.yview_scroll(step * 2, "units")
             self._schedule_thumbnail_request()
 
-    def on_gallery_item_click(self, idx: int, event: tk.Event) -> None:
+    def on_gallery_item_click(self, idx: int, event: tk.Event, action: str = "single") -> None:
         if idx < 0 or idx >= len(self.photos):
             return
 
+        if self.gallery_canvas is not None:
+            self.gallery_canvas.focus_set()
+
         old_keys = set(self.selected_photo_keys)
-        shift_down = bool(event.state & 0x0001)
+        shift_down = action == "range" or bool(event.state & 0x0001)
 
         if shift_down and self.selection_anchor_index is not None:
             start = min(self.selection_anchor_index, idx)
             end = max(self.selection_anchor_index, idx)
             self.selected_photo_keys = {self.photos[i].key for i in range(start, end + 1)}
+            self.selection_focus_index = idx
+        elif action == "toggle":
+            clicked_key = self.photos[idx].key
+            if clicked_key in self.selected_photo_keys:
+                self.selected_photo_keys.remove(clicked_key)
+            else:
+                self.selected_photo_keys.add(clicked_key)
+            self.selection_anchor_index = idx
+            self.selection_focus_index = idx
         else:
             clicked_key = self.photos[idx].key
             if clicked_key in self.selected_photo_keys and len(self.selected_photo_keys) == 1:
                 self.selected_photo_keys.clear()
+                self.selection_anchor_index = None
+                self.selection_focus_index = None
             else:
                 self.selected_photo_keys = {clicked_key}
-            self.selection_anchor_index = idx
+                self.selection_anchor_index = idx
+                self.selection_focus_index = idx
 
         self._refresh_gallery_selection_for_keys(old_keys ^ self.selected_photo_keys)
         self.sync_table_selection_from_model()
         self.update_selection_status()
+
+    def _move_selection_by_arrow(self, direction: int, extend: bool) -> Optional[int]:
+        if not self.photos:
+            return None
+
+        current_idx = self.selection_focus_index
+        if current_idx is None:
+            if self.selected_photo_keys:
+                indices = [self.photo_index_by_key.get(k, 0) for k in self.selected_photo_keys]
+                current_idx = min(indices) if direction < 0 else max(indices)
+            else:
+                current_idx = 0 if direction > 0 else len(self.photos) - 1
+
+        new_idx = max(0, min(len(self.photos) - 1, current_idx + direction))
+        old_keys = set(self.selected_photo_keys)
+
+        if extend:
+            if self.selection_anchor_index is None:
+                self.selection_anchor_index = current_idx
+            anchor = self.selection_anchor_index
+            start = min(anchor, new_idx)
+            end = max(anchor, new_idx)
+            self.selected_photo_keys = {self.photos[i].key for i in range(start, end + 1)}
+            self.selection_focus_index = new_idx
+        else:
+            self.selected_photo_keys = {self.photos[new_idx].key}
+            self.selection_anchor_index = new_idx
+            self.selection_focus_index = new_idx
+
+        self._refresh_gallery_selection_for_keys(old_keys ^ self.selected_photo_keys)
+        self.sync_table_selection_from_model()
+        self.update_selection_status()
+        if self.scroller_active:
+            self._ensure_scroller_index_visible(new_idx)
+        return new_idx
+
+    def _get_primary_selected_photo(self) -> Optional[MemoryPhoto]:
+        if self.selection_focus_index is not None and 0 <= self.selection_focus_index < len(self.photos):
+            return self.photos[self.selection_focus_index]
+
+        if self.selected_photo_keys:
+            first_key = min(
+                self.selected_photo_keys,
+                key=lambda k: self.photo_index_by_key.get(k, len(self.photos) + 1),
+            )
+            return next((p for p in self.photos if p.key == first_key), None)
+
+        selected_items = self.table.selection()
+        if selected_items:
+            return self.photo_by_item.get(selected_items[0])
+        return None
+
+    def on_space_toggle_preview(self, _event: tk.Event) -> str:
+        photo = self._get_primary_selected_photo()
+
+        if photo is None:
+            if self.preview_window is not None and self.preview_window.winfo_exists():
+                self._close_preview_window()
+            return "break"
+
+        if self.preview_window is not None and self.preview_window.winfo_exists():
+            self._close_preview_window()
+        else:
+            self.open_photo_preview_window(photo)
+        return "break"
+
+    def on_select_all_shortcut(self, _event: tk.Event) -> str:
+        if not self.photos:
+            return "break"
+        old_keys = set(self.selected_photo_keys)
+        self.selected_photo_keys = {photo.key for photo in self.photos}
+        self.selection_anchor_index = 0
+        self.selection_focus_index = len(self.photos) - 1
+        self._refresh_gallery_selection_for_keys(old_keys ^ self.selected_photo_keys)
+        self.sync_table_selection_from_model()
+        self.update_selection_status()
+        return "break"
+
+    def on_scroller_arrow_key(self, event: tk.Event) -> str:
+        if self.gallery_canvas is not None:
+            self.gallery_canvas.focus_set()
+
+        direction = -1 if event.keysym.endswith("Up") else 1
+        shift_down = bool(event.state & 0x0001)
+        self._move_selection_by_arrow(direction, shift_down)
+        return "break"
+
+    def _ensure_scroller_index_visible(self, idx: int) -> None:
+        if self.gallery_canvas is None or idx < 0 or idx >= len(self.gallery_cards):
+            return
+        frame = self.gallery_cards[idx]["frame"]
+        self.root.update_idletasks()
+        card_top = frame.winfo_y()
+        card_bottom = card_top + frame.winfo_height()
+        view_top = self.gallery_canvas.canvasy(0)
+        view_bottom = view_top + self.gallery_canvas.winfo_height()
+        content_h = max(1, self.gallery_inner.winfo_height() if self.gallery_inner is not None else 1)
+
+        if card_top < view_top:
+            self.gallery_canvas.yview_moveto(max(0.0, min(1.0, card_top / content_h)))
+        elif card_bottom > view_bottom:
+            target = max(0.0, min(1.0, (card_bottom - self.gallery_canvas.winfo_height()) / content_h))
+            self.gallery_canvas.yview_moveto(target)
+
+        self._schedule_thumbnail_request(1)
+
+    def on_table_arrow_key(self, event: tk.Event) -> str:
+        direction = -1 if event.keysym.endswith("Up") else 1
+        shift_down = bool(event.state & 0x0001)
+        self._move_selection_by_arrow(direction, shift_down)
+        return "break"
 
     def refresh_gallery_selection_styles(self) -> None:
         if not self.scroller_active:
@@ -1098,11 +1239,22 @@ class BeRealDownloaderApp:
         self.selected_photo_keys = new_keys
         if selected_items:
             first_photo = self.photo_by_item.get(selected_items[0])
-            self.selection_anchor_index = (
-                self.photo_index_by_key.get(first_photo.key) if first_photo is not None else None
+            first_idx = self.photo_index_by_key.get(first_photo.key) if first_photo is not None else None
+            if len(selected_items) == 1:
+                self.selection_anchor_index = first_idx
+            elif self.selection_anchor_index is None:
+                self.selection_anchor_index = first_idx
+
+            focus_item = self.table.focus()
+            focus_photo = self.photo_by_item.get(focus_item) if focus_item else None
+            if focus_photo is None:
+                focus_photo = first_photo
+            self.selection_focus_index = (
+                self.photo_index_by_key.get(focus_photo.key) if focus_photo is not None else first_idx
             )
         else:
             self.selection_anchor_index = None
+            self.selection_focus_index = None
 
         self._refresh_gallery_selection_for_keys(old_keys ^ new_keys)
         self.update_selection_status()
@@ -1119,6 +1271,39 @@ class BeRealDownloaderApp:
         if photo is None:
             return
         self.open_photo_preview_window(photo)
+
+    def _close_preview_window(self) -> None:
+        if self.preview_window is not None:
+            try:
+                if self.preview_window.winfo_exists():
+                    self.preview_window.destroy()
+            except Exception:
+                pass
+        self.preview_window = None
+        self.preview_signature = None
+
+    def on_preview_space_close(self, _event: tk.Event) -> str:
+        self._close_preview_window()
+        return "break"
+
+    def on_preview_arrow_nav(self, event: tk.Event) -> str:
+        direction = -1 if event.keysym.endswith("Up") else 1
+        shift_down = bool(event.state & 0x0001)
+        new_idx = self._move_selection_by_arrow(direction, shift_down)
+        if new_idx is None or new_idx < 0 or new_idx >= len(self.photos):
+            return "break"
+
+        next_photo = self.photos[new_idx]
+        mode = self.mode_var.get()
+        if (
+            self.preview_window is not None
+            and self.preview_window.winfo_exists()
+            and self.preview_signature == (next_photo.key, mode)
+        ):
+            return "break"
+
+        self.open_photo_preview_window(next_photo)
+        return "break"
 
     def open_photo_preview_window(self, photo: MemoryPhoto) -> None:
         mode = self.mode_var.get()
@@ -1144,12 +1329,21 @@ class BeRealDownloaderApp:
 
         photo_img = ImageTk.PhotoImage(img)
 
+        self._close_preview_window()
         win = tk.Toplevel(self.root)
         win.title(f"Export Preview - {MODE_LABELS.get(mode, mode)}")
         win.configure(bg="#000000")
+        win.protocol("WM_DELETE_WINDOW", self._close_preview_window)
+        win.bind("<space>", self.on_preview_space_close)
+        win.bind("<Up>", self.on_preview_arrow_nav)
+        win.bind("<Down>", self.on_preview_arrow_nav)
+        win.focus_set()
 
         image_label = tk.Label(win, image=photo_img, bg="#000000", bd=0, highlightthickness=0)
         image_label.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+        image_label.bind("<space>", self.on_preview_space_close)
+        image_label.bind("<Up>", self.on_preview_arrow_nav)
+        image_label.bind("<Down>", self.on_preview_arrow_nav)
 
         info = f"{self._format_time(photo.taken_time)}  |  {MODE_LABELS.get(mode, mode)}"
         info_label = tk.Label(
@@ -1160,8 +1354,13 @@ class BeRealDownloaderApp:
             font=("Helvetica", 11, "bold"),
         )
         info_label.pack(fill=tk.X, padx=8, pady=(0, 8))
+        info_label.bind("<space>", self.on_preview_space_close)
+        info_label.bind("<Up>", self.on_preview_arrow_nav)
+        info_label.bind("<Down>", self.on_preview_arrow_nav)
 
         win.preview_photo = photo_img
+        self.preview_window = win
+        self.preview_signature = (photo.key, mode)
 
     def sync_table_selection_from_model(self) -> None:
         self.suppress_table_select_event = True
@@ -1179,13 +1378,18 @@ class BeRealDownloaderApp:
             if to_add:
                 self.table.selection_add(*to_add)
             if self.selected_photo_keys:
-                first_key = min(
-                    self.selected_photo_keys,
-                    key=lambda k: self.photo_index_by_key.get(k, len(self.photos) + 1),
-                )
-                first_item = self.table_item_by_photo_key.get(first_key)
-                if first_item:
-                    self.table.see(first_item)
+                focus_idx = self.selection_focus_index
+                if focus_idx is not None and 0 <= focus_idx < len(self.photos):
+                    focus_key = self.photos[focus_idx].key
+                else:
+                    focus_key = min(
+                        self.selected_photo_keys,
+                        key=lambda k: self.photo_index_by_key.get(k, len(self.photos) + 1),
+                    )
+                focus_item = self.table_item_by_photo_key.get(focus_key)
+                if focus_item:
+                    self.table.focus(focus_item)
+                    self.table.see(focus_item)
         finally:
             self.suppress_table_select_event = False
 
@@ -1217,6 +1421,7 @@ class BeRealDownloaderApp:
         self.photos = photos
         self.selected_photo_keys.clear()
         self.selection_anchor_index = None
+        self.selection_focus_index = None
         self.card_meta_visible_keys.clear()
         self.show_all_metadata_var.set(False)
 
