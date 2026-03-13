@@ -1305,6 +1305,22 @@ class BeRealDownloaderApp:
         self.open_photo_preview_window(next_photo)
         return "break"
 
+    def _center_window_over_root(self, win: tk.Toplevel) -> None:
+        self.root.update_idletasks()
+        win.update_idletasks()
+
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = max(1, self.root.winfo_width())
+        root_h = max(1, self.root.winfo_height())
+
+        win_w = max(1, win.winfo_reqwidth())
+        win_h = max(1, win.winfo_reqheight())
+
+        x = root_x + (root_w - win_w) // 2
+        y = root_y + (root_h - win_h) // 2
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+
     def open_photo_preview_window(self, photo: MemoryPhoto) -> None:
         mode = self.mode_var.get()
         try:
@@ -1333,11 +1349,11 @@ class BeRealDownloaderApp:
         win = tk.Toplevel(self.root)
         win.title(f"Export Preview - {MODE_LABELS.get(mode, mode)}")
         win.configure(bg="#000000")
+        win.transient(self.root)
         win.protocol("WM_DELETE_WINDOW", self._close_preview_window)
         win.bind("<space>", self.on_preview_space_close)
         win.bind("<Up>", self.on_preview_arrow_nav)
         win.bind("<Down>", self.on_preview_arrow_nav)
-        win.focus_set()
 
         image_label = tk.Label(win, image=photo_img, bg="#000000", bd=0, highlightthickness=0)
         image_label.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
@@ -1357,6 +1373,15 @@ class BeRealDownloaderApp:
         info_label.bind("<space>", self.on_preview_space_close)
         info_label.bind("<Up>", self.on_preview_arrow_nav)
         info_label.bind("<Down>", self.on_preview_arrow_nav)
+
+        self._center_window_over_root(win)
+        win.lift()
+        try:
+            win.attributes("-topmost", True)
+            win.after(40, lambda w=win: w.attributes("-topmost", False) if w.winfo_exists() else None)
+        except Exception:
+            pass
+        win.focus_force()
 
         win.preview_photo = photo_img
         self.preview_window = win
