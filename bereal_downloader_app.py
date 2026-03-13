@@ -45,6 +45,8 @@ CARD_BG_MISSING = "#ffe9e9"
 CARD_BG_DOWNLOADED = "#e9f8ee"
 META_UI_BG = "#000000"
 META_UI_FG = "#ffffff"
+PREVIEW_ZOOM_MIN = 0.6
+PREVIEW_ZOOM_MAX = 1.8
 
 
 @dataclass
@@ -370,6 +372,8 @@ class BeRealDownloaderApp:
         self.mode_var = tk.StringVar(value=MODE_BEREAL_FRONT_TL)
         self.show_all_metadata_var = tk.BooleanVar(value=False)
         self.skip_existing_var = tk.BooleanVar(value=True)
+        self.preview_zoom = 1.0
+        self.zoom_label_var = tk.StringVar(value="100%")
         self.status_var = tk.StringVar(value="Select an export folder and click Load Data.")
         self.selection_status_var = tk.StringVar(value="Selected: 0")
 
@@ -557,12 +561,19 @@ class BeRealDownloaderApp:
             top,
             text="Image preview scroller (1 per row). Click to select, Shift+Click for range. Use the i button for metadata.",
         ).pack(side=tk.LEFT)
+        right_controls = ttk.Frame(top)
+        right_controls.pack(side=tk.RIGHT)
+        ttk.Button(right_controls, text="-", width=3, command=self.on_zoom_out).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(right_controls, textvariable=self.zoom_label_var, width=6, anchor="center").pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(right_controls, text="+", width=3, command=self.on_zoom_in).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Checkbutton(
-            top,
+            right_controls,
             text="Show metadata on all cards",
             variable=self.show_all_metadata_var,
             command=self.on_toggle_all_metadata,
-        ).pack(side=tk.RIGHT)
+        ).pack(side=tk.LEFT)
 
         self.scroller_container = ttk.Frame(parent, padding=(8, 4, 8, 8))
         self.scroller_container.pack(fill=tk.BOTH, expand=True)
@@ -599,6 +610,25 @@ class BeRealDownloaderApp:
     def on_export_mode_changed(self) -> None:
         self.refresh_table()
         self.request_scroller_refresh()
+
+    def _set_preview_zoom(self, new_zoom: float) -> None:
+        clamped = max(PREVIEW_ZOOM_MIN, min(PREVIEW_ZOOM_MAX, new_zoom))
+        clamped = round(clamped, 2)
+        if abs(clamped - self.preview_zoom) < 0.005:
+            return
+        self.preview_zoom = clamped
+        self.zoom_label_var.set(f"{int(round(self.preview_zoom * 100))}%")
+        self.last_target_preview_width = 0
+        self._invalidate_preview_cache_for_resize()
+        for card in self.gallery_cards:
+            self.update_card_metadata_visibility(card)
+        self._schedule_thumbnail_request(1)
+
+    def on_zoom_in(self) -> None:
+        self._set_preview_zoom(self.preview_zoom * 1.15)
+
+    def on_zoom_out(self) -> None:
+        self._set_preview_zoom(self.preview_zoom / 1.15)
 
     def refresh_scroller(self) -> None:
         if self.gallery_inner is None:
@@ -650,15 +680,15 @@ class BeRealDownloaderApp:
             height=24,
             bd=0,
             highlightthickness=0,
-            bg=META_UI_BG,
+            bg=CARD_BG_DEFAULT,
             cursor="hand2",
         )
-        meta_button_oval = meta_button.create_oval(1, 1, 23, 23, fill="#000000", outline="#ffffff", width=1)
+        meta_button_oval = meta_button.create_oval(1, 1, 23, 23, fill="#ffffff", outline="#ffffff", width=1)
         meta_button_text = meta_button.create_text(
             12,
             12,
             text="i",
-            fill="#ffffff",
+            fill="#000000",
             font=("Helvetica", 11, "bold"),
         )
         meta_button.bind("<Button-1>", lambda _e, k=photo.key: self.show_card_metadata(k))
@@ -810,12 +840,14 @@ class BeRealDownloaderApp:
 
     def _current_target_preview_width(self) -> int:
         if self.gallery_canvas is None:
-            return 760
+            return int(760 * self.preview_zoom)
         canvas_w = self.gallery_canvas.winfo_width()
         if canvas_w <= 1:
-            return 760
+            return int(760 * self.preview_zoom)
         # One card per row, intentionally smaller than full width.
-        return min(980, max(560, canvas_w - 220))
+        base_w = min(980, max(560, canvas_w - 220))
+        zoomed = int(base_w * self.preview_zoom)
+        return min(1700, max(360, zoomed))
 
     def _handle_preview_width_change(self) -> None:
         new_width = self._current_target_preview_width()
@@ -868,8 +900,8 @@ class BeRealDownloaderApp:
             step = 1
 
         if step != 0:
-            self.gallery_canvas.yview_scroll(step * 2, "units")
-            self._schedule_thumbnail_request()
+            self.gallery_canvas.yview_scroll(step, "units")
+            self._schedule_thumbnail_request(120)
 
     def on_gallery_item_click(self, idx: int, event: tk.Event, action: str = "single") -> None:
         if idx < 0 or idx >= len(self.photos):
@@ -1053,11 +1085,11 @@ class BeRealDownloaderApp:
             widget.configure(bg=bg)
         card["meta_overlay"].configure(bg=META_UI_BG)
         card["meta_label"].configure(bg=META_UI_BG, fg=META_UI_FG)
-        card["meta_button"].configure(bg=META_UI_BG, highlightthickness=0)
-        card["meta_button"].itemconfigure(card["meta_button_oval"], fill="#000000", outline="#ffffff")
-        card["meta_button"].itemconfigure(card["meta_button_text"], fill="#ffffff")
+        card["meta_button"].configure(bg=bg, highlightthickness=0)
+        card["meta_button"].itemconfigure(card["meta_button_oval"], fill="#ffffff", outline="#ffffff")
+        card["meta_button"].itemconfigure(card["meta_button_text"], fill="#000000")
 
-    def _schedule_thumbnail_request(self, delay_ms: int = 70) -> None:
+    def _schedule_thumbnail_request(self, delay_ms: int = 110) -> None:
         if not self.scroller_active:
             return
         if self.thumbnail_request_after_id is not None:
@@ -1076,7 +1108,14 @@ class BeRealDownloaderApp:
             return
 
         mode = self.mode_var.get()
-        for idx in self._visible_card_indices():
+        visible_indices = self._visible_card_indices()
+        visible_set = set(visible_indices)
+
+        if self.thumbnail_job_queue:
+            self.thumbnail_job_queue = deque(idx for idx in self.thumbnail_job_queue if idx in visible_set)
+            self.thumbnail_job_set = set(self.thumbnail_job_queue)
+
+        for idx in visible_indices:
             if idx in self.thumbnail_job_set or idx < 0 or idx >= len(self.gallery_cards):
                 continue
             card = self.gallery_cards[idx]
@@ -1112,7 +1151,7 @@ class BeRealDownloaderApp:
             return
 
         mode = self.mode_var.get()
-        batch_size = 6
+        batch_size = 2
         for _ in range(batch_size):
             if not self.thumbnail_job_queue:
                 break
@@ -1139,7 +1178,7 @@ class BeRealDownloaderApp:
                 card["image_label"].image = None
 
         if self.thumbnail_job_queue:
-            self.thumbnail_job_after_id = self.root.after(12, self._process_thumbnail_batch)
+            self.thumbnail_job_after_id = self.root.after(10, self._process_thumbnail_batch)
         else:
             self.thumbnail_job_after_id = None
 
@@ -1162,7 +1201,7 @@ class BeRealDownloaderApp:
     def _build_thumbnail(self, photo: MemoryPhoto, mode: str) -> Optional["ImageTk.PhotoImage"]:
         try:
             target_w = self._current_target_preview_width()
-            source_max_side = min(2600, max(1200, target_w * 2))
+            source_max_side = min(1700, max(900, int(target_w * 1.4)))
             downloaded_output = self.history.get_output_path(photo.key, mode)
 
             if downloaded_output is not None and downloaded_output.exists():
@@ -1180,13 +1219,13 @@ class BeRealDownloaderApp:
                     if not photo.front_path.exists() or not photo.back_path.exists():
                         return None
                     base = self._open_preview_image(photo.back_path, source_max_side)
-                    inset = self._open_preview_image(photo.front_path, max(700, int(source_max_side * 0.58)))
+                    inset = self._open_preview_image(photo.front_path, max(520, int(source_max_side * 0.52)))
                     img = ImageExporter._compose(base=base, inset=inset)
                 elif mode == MODE_BEREAL_BACK_TL:
                     if not photo.front_path.exists() or not photo.back_path.exists():
                         return None
                     base = self._open_preview_image(photo.front_path, source_max_side)
-                    inset = self._open_preview_image(photo.back_path, max(700, int(source_max_side * 0.58)))
+                    inset = self._open_preview_image(photo.back_path, max(520, int(source_max_side * 0.52)))
                     img = ImageExporter._compose(base=base, inset=inset)
                 else:
                     if not photo.front_path.exists():
@@ -1347,6 +1386,7 @@ class BeRealDownloaderApp:
 
         self._close_preview_window()
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(f"Export Preview - {MODE_LABELS.get(mode, mode)}")
         win.configure(bg="#000000")
         win.transient(self.root)
@@ -1375,6 +1415,7 @@ class BeRealDownloaderApp:
         info_label.bind("<Down>", self.on_preview_arrow_nav)
 
         self._center_window_over_root(win)
+        win.deiconify()
         win.lift()
         try:
             win.attributes("-topmost", True)
