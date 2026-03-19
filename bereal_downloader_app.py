@@ -284,6 +284,9 @@ class ImageExporter:
             exif[306] = exif_dt
             exif[36867] = exif_dt
             exif[36868] = exif_dt
+        gps_ifd = self._build_gps_ifd(photo.location, photo.taken_time)
+        if gps_ifd:
+            exif[34853] = gps_ifd
 
         output_img.save(output_path, format="JPEG", quality=95, exif=exif)
 
@@ -428,6 +431,45 @@ class ImageExporter:
             return None
         local_dt = dt.astimezone()
         return local_dt.strftime("%Y:%m:%d %H:%M:%S")
+
+    def _build_gps_ifd(
+        self, location: Optional[Dict[str, float]], taken_time: str
+    ) -> Optional[Dict[int, object]]:
+        if not location:
+            return None
+
+        lat = location.get("latitude")
+        lon = location.get("longitude")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return None
+
+        gps_ifd: Dict[int, object] = {
+            1: "N" if lat >= 0 else "S",
+            2: self._decimal_to_dms(abs(float(lat))),
+            3: "E" if lon >= 0 else "W",
+            4: self._decimal_to_dms(abs(float(lon))),
+            27: "WGS-84",
+        }
+
+        dt = self._parse_iso(taken_time)
+        if dt:
+            utc_dt = dt.astimezone(timezone.utc)
+            gps_ifd[7] = (
+                float(utc_dt.hour),
+                float(utc_dt.minute),
+                float(utc_dt.second + utc_dt.microsecond / 1_000_000),
+            )
+            gps_ifd[29] = utc_dt.strftime("%Y:%m:%d")
+
+        return gps_ifd
+
+    @staticmethod
+    def _decimal_to_dms(value: float) -> Tuple[float, float, float]:
+        degrees = int(value)
+        minutes_total = (value - degrees) * 60
+        minutes = int(minutes_total)
+        seconds = (minutes_total - minutes) * 60
+        return (float(degrees), float(minutes), float(seconds))
 
 
 class BeRealDownloaderApp:
