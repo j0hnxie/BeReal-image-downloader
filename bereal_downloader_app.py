@@ -16,9 +16,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 try:
-    from PIL import Image, ImageOps, ImageTk
+    from PIL import Image, ImageDraw, ImageOps, ImageTk
 except Exception:  # pragma: no cover - runtime environment dependent
     Image = None
+    ImageDraw = None
     ImageOps = None
     ImageTk = None
 
@@ -42,7 +43,6 @@ GALLERY_MAX_COLUMNS = 1
 CARD_BG_DEFAULT = "#e9ecef"
 CARD_BG_SELECTED = "#cfe8ff"
 CARD_BG_MISSING = "#ffe9e9"
-CARD_BG_DOWNLOADED = "#e9f8ee"
 META_UI_BG = "#000000"
 META_UI_FG = "#ffffff"
 PREVIEW_ZOOM_MIN = 0.6
@@ -302,22 +302,47 @@ class ImageExporter:
 
     @staticmethod
     def _compose(base: "Image.Image", inset: "Image.Image") -> "Image.Image":
+        if ImageDraw is None:
+            raise RuntimeError("Pillow ImageDraw support is required for BeReal composition.")
+
         composed = base.copy()
-
-        inset_target_w = max(140, int(composed.width * 0.28))
+        inset_target_w = max(140, int(composed.width * 0.315))
+        inset_target_h = max(140, int(composed.height * 0.315))
         inset_copy = inset.copy()
-        inset_copy.thumbnail((inset_target_w, inset_target_w), Image.Resampling.LANCZOS)
-
-        border = max(2, int(composed.width * 0.008))
-        framed = Image.new(
-            "RGB",
-            (inset_copy.width + border * 2, inset_copy.height + border * 2),
-            (255, 255, 255),
+        inset_copy = ImageOps.fit(
+            inset_copy,
+            (inset_target_w, inset_target_h),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
         )
-        framed.paste(inset_copy, (border, border))
 
-        margin = max(8, int(composed.width * 0.03))
-        composed.paste(framed, (margin, margin))
+        border = max(2, int(composed.width * 0.004))
+        radius = max(12, int(min(inset_target_w, inset_target_h) * 0.12))
+        framed_w = inset_target_w + border * 2
+        framed_h = inset_target_h + border * 2
+
+        framed = Image.new("RGBA", (framed_w, framed_h), (0, 0, 0, 0))
+        border_mask = Image.new("L", (framed_w, framed_h), 0)
+        ImageDraw.Draw(border_mask).rounded_rectangle(
+            (0, 0, framed_w - 1, framed_h - 1),
+            radius=radius + border,
+            fill=255,
+        )
+        framed.paste((0, 0, 0, 255), (0, 0), border_mask)
+
+        inset_mask = Image.new("L", (inset_target_w, inset_target_h), 0)
+        ImageDraw.Draw(inset_mask).rounded_rectangle(
+            (0, 0, inset_target_w - 1, inset_target_h - 1),
+            radius=radius,
+            fill=255,
+        )
+        inset_rgba = inset_copy.convert("RGBA")
+        framed.paste(inset_rgba, (border, border), inset_mask)
+
+        margin = max(10, int(composed.width * 0.028))
+        composed_rgba = composed.convert("RGBA")
+        composed_rgba.alpha_composite(framed, dest=(margin, margin))
+        composed = composed_rgba.convert("RGB")
         return composed
 
     def _build_output_path(self, photo: MemoryPhoto, mode: str) -> Path:
@@ -611,7 +636,6 @@ class BeRealDownloaderApp:
 
     def _configure_row_tags(self) -> None:
         self.table.tag_configure("missing", background="#ffe9e9")
-        self.table.tag_configure("downloaded_mode", background="#e9f8ee")
 
     def on_export_mode_changed(self) -> None:
         self.refresh_table()
@@ -1100,14 +1124,11 @@ class BeRealDownloaderApp:
         photo: MemoryPhoto = card["photo"]
         selected = photo.key in self.selected_photo_keys
         missing = (not photo.front_path.exists()) or (not photo.back_path.exists())
-        downloaded = self.history.has_mode(photo.key, self.mode_var.get())
 
         if selected:
             bg = CARD_BG_SELECTED
         elif missing:
             bg = CARD_BG_MISSING
-        elif downloaded:
-            bg = CARD_BG_DOWNLOADED
         else:
             bg = CARD_BG_DEFAULT
 
@@ -1231,40 +1252,8 @@ class BeRealDownloaderApp:
     def _build_thumbnail(self, photo: MemoryPhoto, mode: str) -> Optional["ImageTk.PhotoImage"]:
         try:
             target_w = self._current_target_preview_width()
-            source_max_side = min(1700, max(900, int(target_w * 1.4)))
-            downloaded_output = self.history.get_output_path(photo.key, mode)
-
-            if downloaded_output is not None and downloaded_output.exists():
-                img = self._open_preview_image(downloaded_output, source_max_side)
-            else:
-                if mode == MODE_FRONT_ONLY:
-                    if not photo.front_path.exists():
-                        return None
-                    img = self._open_preview_image(photo.front_path, source_max_side)
-                elif mode == MODE_BACK_ONLY:
-                    if not photo.back_path.exists():
-                        return None
-                    img = self._open_preview_image(photo.back_path, source_max_side)
-                elif mode == MODE_BEREAL_FRONT_TL:
-                    if not photo.front_path.exists() or not photo.back_path.exists():
-                        return None
-                    base = self._open_preview_image(photo.back_path, source_max_side)
-                    inset = self._open_preview_image(photo.front_path, max(520, int(source_max_side * 0.52)))
-                    img = ImageExporter._compose(base=base, inset=inset)
-                elif mode == MODE_BEREAL_BACK_TL:
-                    if not photo.front_path.exists() or not photo.back_path.exists():
-                        return None
-                    base = self._open_preview_image(photo.front_path, source_max_side)
-                    inset = self._open_preview_image(photo.back_path, max(520, int(source_max_side * 0.52)))
-                    img = ImageExporter._compose(base=base, inset=inset)
-                else:
-                    if not photo.front_path.exists():
-                        return None
-                    img = self._open_preview_image(photo.front_path, source_max_side)
-
-            if img.width > 0 and img.width != target_w:
-                target_h = max(1, int(img.height * (target_w / img.width)))
-                img = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+            target_h = max(900, int(target_w * 1.8))
+            img = self._render_preview_image(photo, mode, target_w, target_h)
             return ImageTk.PhotoImage(img)
         except Exception:
             return None
@@ -1627,8 +1616,6 @@ class BeRealDownloaderApp:
             tags = []
             if not photo.front_path.exists() or not photo.back_path.exists():
                 tags.append("missing")
-            elif downloaded_mode == "Yes":
-                tags.append("downloaded_mode")
 
             loc = self._format_location(photo.location)
             files = "OK" if photo.front_path.exists() and photo.back_path.exists() else "Missing"
