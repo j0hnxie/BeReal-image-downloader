@@ -152,6 +152,7 @@ class HistoryStore:
         self.history_path = history_path or self._default_history_path()
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         self._data = self._load()
+        self._dirty = False
 
     @staticmethod
     def _default_history_path() -> Path:
@@ -178,25 +179,71 @@ class HistoryStore:
             return {"version": 1, "entries": {}}
 
     def save(self) -> None:
+        if not self._dirty:
+            return
         tmp_path = self.history_path.with_suffix(".tmp")
         with tmp_path.open("w", encoding="utf-8") as f:
             json.dump(self._data, f, indent=2)
         tmp_path.replace(self.history_path)
+        self._dirty = False
+
+    def _get_entry(self, photo_key: str, mode: str) -> Optional[Dict]:
+        entry = self._data.get("entries", {}).get(photo_key, {}).get(mode)
+        return entry if isinstance(entry, dict) else None
+
+    def _entry_output_exists(self, entry: Dict) -> bool:
+        output_raw = entry.get("outputPath")
+        return isinstance(output_raw, str) and bool(output_raw) and Path(output_raw).exists()
+
+    def _prune_mode(self, photo_key: str, mode: str) -> None:
+        entries = self._data.get("entries", {})
+        photo_entry = entries.get(photo_key)
+        if not isinstance(photo_entry, dict) or mode not in photo_entry:
+            return
+        del photo_entry[mode]
+        if not photo_entry:
+            entries.pop(photo_key, None)
+        self._dirty = True
 
     def has_mode(self, photo_key: str, mode: str) -> bool:
-        return mode in self._data.get("entries", {}).get(photo_key, {})
+        entry = self._get_entry(photo_key, mode)
+        if entry is None:
+            return False
+        if not self._entry_output_exists(entry):
+            self._prune_mode(photo_key, mode)
+            return False
+        return True
 
     def downloaded_modes(self, photo_key: str) -> List[str]:
-        return sorted(self._data.get("entries", {}).get(photo_key, {}).keys())
+        photo_entry = self._data.get("entries", {}).get(photo_key, {})
+        if not isinstance(photo_entry, dict):
+            return []
+
+        modes: List[str] = []
+        stale_modes: List[str] = []
+        for mode, entry in photo_entry.items():
+            if not isinstance(entry, dict) or not self._entry_output_exists(entry):
+                stale_modes.append(mode)
+                continue
+            modes.append(mode)
+
+        for mode in stale_modes:
+            self._prune_mode(photo_key, mode)
+
+        return sorted(modes)
 
     def get_output_path(self, photo_key: str, mode: str) -> Optional[Path]:
-        entry = self._data.get("entries", {}).get(photo_key, {}).get(mode)
-        if not isinstance(entry, dict):
+        entry = self._get_entry(photo_key, mode)
+        if entry is None:
             return None
         output_raw = entry.get("outputPath")
         if not isinstance(output_raw, str) or not output_raw:
             return None
-        return Path(output_raw)
+        output_path = Path(output_raw)
+        if not output_path.exists():
+            self._prune_mode(photo_key, mode)
+            return None
+        return output_path
 
     def mark_download(self, photo_key: str, mode: str, output_path: Path, sidecar_path: Path) -> None:
         entries = self._data.setdefault("entries", {})
@@ -206,6 +253,7 @@ class HistoryStore:
             "outputPath": str(output_path),
             "metadataPath": str(sidecar_path),
         }
+        self._dirty = True
 
 
 class ImageExporter:
