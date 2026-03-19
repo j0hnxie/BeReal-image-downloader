@@ -47,6 +47,8 @@ META_UI_BG = "#000000"
 META_UI_FG = "#ffffff"
 PREVIEW_ZOOM_MIN = 0.6
 PREVIEW_ZOOM_MAX = 1.8
+PREVIEW_ZOOM_DEFAULT = 0.8
+PREVIEW_NAV_DEBOUNCE_MS = 45
 
 
 @dataclass
@@ -372,8 +374,8 @@ class BeRealDownloaderApp:
         self.mode_var = tk.StringVar(value=MODE_BEREAL_FRONT_TL)
         self.show_all_metadata_var = tk.BooleanVar(value=False)
         self.skip_existing_var = tk.BooleanVar(value=True)
-        self.preview_zoom = 1.0
-        self.zoom_label_var = tk.StringVar(value="100%")
+        self.preview_zoom = PREVIEW_ZOOM_DEFAULT
+        self.zoom_label_var = tk.StringVar(value=f"{int(round(PREVIEW_ZOOM_DEFAULT * 100))}%")
         self.status_var = tk.StringVar(value="Select an export folder and click Load Data.")
         self.selection_status_var = tk.StringVar(value="Selected: 0")
 
@@ -407,6 +409,10 @@ class BeRealDownloaderApp:
         self.scroller_needs_refresh: bool = True
         self.preview_window: Optional[tk.Toplevel] = None
         self.preview_signature: Optional[Tuple[str, str]] = None
+        self.preview_image_label: Optional[tk.Label] = None
+        self.preview_info_label: Optional[tk.Label] = None
+        self.preview_nav_after_id: Optional[str] = None
+        self.preview_nav_pending_index: Optional[int] = None
 
         self._build_ui()
         self._configure_row_tags()
@@ -1024,7 +1030,19 @@ class BeRealDownloaderApp:
 
         direction = -1 if event.keysym.endswith("Up") else 1
         shift_down = bool(event.state & 0x0001)
-        self._move_selection_by_arrow(direction, shift_down)
+        new_idx = self._move_selection_by_arrow(direction, shift_down)
+        if (
+            new_idx is not None
+            and self.preview_window is not None
+            and self.preview_window.winfo_exists()
+        ):
+            self.preview_nav_pending_index = new_idx
+            if self.preview_nav_after_id is not None:
+                try:
+                    self.root.after_cancel(self.preview_nav_after_id)
+                except Exception:
+                    pass
+            self.preview_nav_after_id = self.root.after(PREVIEW_NAV_DEBOUNCE_MS, self._open_pending_preview_from_nav)
         return "break"
 
     def _ensure_scroller_index_visible(self, idx: int) -> None:
@@ -1049,7 +1067,19 @@ class BeRealDownloaderApp:
     def on_table_arrow_key(self, event: tk.Event) -> str:
         direction = -1 if event.keysym.endswith("Up") else 1
         shift_down = bool(event.state & 0x0001)
-        self._move_selection_by_arrow(direction, shift_down)
+        new_idx = self._move_selection_by_arrow(direction, shift_down)
+        if (
+            new_idx is not None
+            and self.preview_window is not None
+            and self.preview_window.winfo_exists()
+        ):
+            self.preview_nav_pending_index = new_idx
+            if self.preview_nav_after_id is not None:
+                try:
+                    self.root.after_cancel(self.preview_nav_after_id)
+                except Exception:
+                    pass
+            self.preview_nav_after_id = self.root.after(PREVIEW_NAV_DEBOUNCE_MS, self._open_pending_preview_from_nav)
         return "break"
 
     def refresh_gallery_selection_styles(self) -> None:
@@ -1312,6 +1342,14 @@ class BeRealDownloaderApp:
         self.open_photo_preview_window(photo)
 
     def _close_preview_window(self) -> None:
+        if self.preview_nav_after_id is not None:
+            try:
+                self.root.after_cancel(self.preview_nav_after_id)
+            except Exception:
+                pass
+            self.preview_nav_after_id = None
+        self.preview_nav_pending_index = None
+
         if self.preview_window is not None:
             try:
                 if self.preview_window.winfo_exists():
@@ -1319,6 +1357,8 @@ class BeRealDownloaderApp:
             except Exception:
                 pass
         self.preview_window = None
+        self.preview_image_label = None
+        self.preview_info_label = None
         self.preview_signature = None
 
     def on_preview_space_close(self, _event: tk.Event) -> str:
@@ -1332,17 +1372,31 @@ class BeRealDownloaderApp:
         if new_idx is None or new_idx < 0 or new_idx >= len(self.photos):
             return "break"
 
-        next_photo = self.photos[new_idx]
+        self.preview_nav_pending_index = new_idx
+        if self.preview_nav_after_id is not None:
+            try:
+                self.root.after_cancel(self.preview_nav_after_id)
+            except Exception:
+                pass
+        self.preview_nav_after_id = self.root.after(PREVIEW_NAV_DEBOUNCE_MS, self._open_pending_preview_from_nav)
+        return "break"
+
+    def _open_pending_preview_from_nav(self) -> None:
+        self.preview_nav_after_id = None
+        idx = self.preview_nav_pending_index
+        self.preview_nav_pending_index = None
+        if idx is None or idx < 0 or idx >= len(self.photos):
+            return
+
+        next_photo = self.photos[idx]
         mode = self.mode_var.get()
         if (
             self.preview_window is not None
             and self.preview_window.winfo_exists()
             and self.preview_signature == (next_photo.key, mode)
         ):
-            return "break"
-
-        self.open_photo_preview_window(next_photo)
-        return "break"
+            return
+        self.open_photo_preview_window(next_photo, show_errors=False)
 
     def _center_window_over_root(self, win: tk.Toplevel) -> None:
         self.root.update_idletasks()
@@ -1360,29 +1414,87 @@ class BeRealDownloaderApp:
         y = root_y + (root_h - win_h) // 2
         win.geometry(f"+{max(0, x)}+{max(0, y)}")
 
-    def open_photo_preview_window(self, photo: MemoryPhoto) -> None:
-        mode = self.mode_var.get()
-        try:
-            downloaded_output = self.history.get_output_path(photo.key, mode)
-            if downloaded_output is not None and downloaded_output.exists():
-                with Image.open(downloaded_output) as source:
-                    img = ImageOps.exif_transpose(source).convert("RGB")
-            else:
+    def _render_preview_image(self, photo: MemoryPhoto, mode: str, max_w: int, max_h: int) -> "Image.Image":
+        source_max_side = min(2200, max(900, int(max(max_w, max_h) * 1.25)))
+        downloaded_output = self.history.get_output_path(photo.key, mode)
+        if downloaded_output is not None and downloaded_output.exists():
+            img = self._open_preview_image(downloaded_output, source_max_side)
+        else:
+            if mode == MODE_FRONT_ONLY:
+                if not photo.front_path.exists():
+                    raise FileNotFoundError("Front image file is missing.")
+                img = self._open_preview_image(photo.front_path, source_max_side)
+            elif mode == MODE_BACK_ONLY:
+                if not photo.back_path.exists():
+                    raise FileNotFoundError("Back image file is missing.")
+                img = self._open_preview_image(photo.back_path, source_max_side)
+            elif mode == MODE_BEREAL_FRONT_TL:
                 if not photo.front_path.exists() or not photo.back_path.exists():
-                    messagebox.showerror("Preview unavailable", "Source image files are missing for this row.")
-                    return
-                img = self.exporter.render_output_image(photo, mode)
-        except Exception as exc:
-            messagebox.showerror("Preview failed", str(exc))
-            return
+                    raise FileNotFoundError("Front or back image file is missing.")
+                base = self._open_preview_image(photo.back_path, source_max_side)
+                inset = self._open_preview_image(photo.front_path, max(520, int(source_max_side * 0.52)))
+                img = ImageExporter._compose(base=base, inset=inset)
+            elif mode == MODE_BEREAL_BACK_TL:
+                if not photo.front_path.exists() or not photo.back_path.exists():
+                    raise FileNotFoundError("Front or back image file is missing.")
+                base = self._open_preview_image(photo.front_path, source_max_side)
+                inset = self._open_preview_image(photo.back_path, max(520, int(source_max_side * 0.52)))
+                img = ImageExporter._compose(base=base, inset=inset)
+            else:
+                if not photo.front_path.exists():
+                    raise FileNotFoundError("Front image file is missing.")
+                img = self._open_preview_image(photo.front_path, source_max_side)
 
-        max_w = int(self.root.winfo_screenwidth() * 0.82)
-        max_h = int(self.root.winfo_screenheight() * 0.82)
         if img.width > max_w or img.height > max_h:
             scale = min(max_w / img.width, max_h / img.height)
             img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.Resampling.LANCZOS)
+        return img
+
+    def _raise_preview_window(self, win: tk.Toplevel) -> None:
+        win.lift()
+        try:
+            win.attributes("-topmost", True)
+            win.after(40, lambda w=win: w.attributes("-topmost", False) if w.winfo_exists() else None)
+        except Exception:
+            pass
+        win.focus_force()
+
+    def open_photo_preview_window(self, photo: MemoryPhoto, show_errors: bool = True) -> None:
+        if self.preview_nav_after_id is not None:
+            try:
+                self.root.after_cancel(self.preview_nav_after_id)
+            except Exception:
+                pass
+            self.preview_nav_after_id = None
+        self.preview_nav_pending_index = None
+
+        mode = self.mode_var.get()
+        max_w = int(self.root.winfo_screenwidth() * 0.82)
+        max_h = int(self.root.winfo_screenheight() * 0.82)
+
+        try:
+            img = self._render_preview_image(photo, mode, max_w, max_h)
+        except Exception as exc:
+            if show_errors:
+                messagebox.showerror("Preview failed", str(exc))
+            return
 
         photo_img = ImageTk.PhotoImage(img)
+        info = f"{self._format_time(photo.taken_time)}  |  {MODE_LABELS.get(mode, mode)}"
+
+        if (
+            self.preview_window is not None
+            and self.preview_window.winfo_exists()
+            and self.preview_image_label is not None
+            and self.preview_info_label is not None
+        ):
+            self.preview_image_label.configure(image=photo_img)
+            self.preview_image_label.image = photo_img
+            self.preview_info_label.configure(text=info)
+            self.preview_window.preview_photo = photo_img
+            self.preview_signature = (photo.key, mode)
+            self._raise_preview_window(self.preview_window)
+            return
 
         self._close_preview_window()
         win = tk.Toplevel(self.root)
@@ -1401,7 +1513,6 @@ class BeRealDownloaderApp:
         image_label.bind("<Up>", self.on_preview_arrow_nav)
         image_label.bind("<Down>", self.on_preview_arrow_nav)
 
-        info = f"{self._format_time(photo.taken_time)}  |  {MODE_LABELS.get(mode, mode)}"
         info_label = tk.Label(
             win,
             text=info,
@@ -1416,16 +1527,12 @@ class BeRealDownloaderApp:
 
         self._center_window_over_root(win)
         win.deiconify()
-        win.lift()
-        try:
-            win.attributes("-topmost", True)
-            win.after(40, lambda w=win: w.attributes("-topmost", False) if w.winfo_exists() else None)
-        except Exception:
-            pass
-        win.focus_force()
+        self._raise_preview_window(win)
 
         win.preview_photo = photo_img
         self.preview_window = win
+        self.preview_image_label = image_label
+        self.preview_info_label = info_label
         self.preview_signature = (photo.key, mode)
 
     def sync_table_selection_from_model(self) -> None:
