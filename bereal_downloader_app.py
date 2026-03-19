@@ -260,7 +260,9 @@ class ImageExporter:
     def __init__(self, downloads_root: Optional[Path] = None) -> None:
         self.downloads_root = downloads_root or (Path.home() / "Downloads" / "BeReal-Exports")
 
-    def export_photo(self, photo: MemoryPhoto, mode: str) -> Tuple[Path, Path]:
+    def export_photo(
+        self, photo: MemoryPhoto, mode: str, overwrite_path: Optional[Path] = None
+    ) -> Tuple[Path, Path]:
         if Image is None or ImageOps is None:
             raise RuntimeError("Pillow is not installed. Run: pip install -r requirements.txt")
 
@@ -271,7 +273,7 @@ class ImageExporter:
 
         output_img = self.render_output_image(photo, mode)
 
-        output_path = self._build_output_path(photo, mode)
+        output_path = overwrite_path or self._build_output_path(photo, mode)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         sidecar_path = output_path.with_suffix(".json")
 
@@ -1708,6 +1710,24 @@ class BeRealDownloaderApp:
 
     def _download_photos(self, photos: List[MemoryPhoto]) -> None:
         mode = self.mode_var.get()
+        existing_outputs = {
+            photo.key: self.history.get_output_path(photo.key, mode)
+            for photo in photos
+        }
+        existing_count = sum(1 for path in existing_outputs.values() if path is not None)
+
+        if existing_count and not self.skip_existing_var.get():
+            mode_label = MODE_LABELS.get(mode, mode)
+            should_overwrite = messagebox.askyesno(
+                "Confirm overwrite",
+                (
+                    f"{existing_count} selected export(s) already exist for {mode_label}.\n\n"
+                    "Overwrite the existing image and metadata files?"
+                ),
+            )
+            if not should_overwrite:
+                self.status_var.set("Overwrite canceled.")
+                return
 
         succeeded = 0
         skipped = 0
@@ -1720,12 +1740,18 @@ class BeRealDownloaderApp:
             self.status_var.set(f"Exporting {i}/{total}...")
             self.root.update_idletasks()
 
-            if self.skip_existing_var.get() and self.history.has_mode(photo.key, mode):
+            existing_output_path = existing_outputs.get(photo.key)
+
+            if self.skip_existing_var.get() and existing_output_path is not None:
                 skipped += 1
                 continue
 
             try:
-                out_path, sidecar_path = self.exporter.export_photo(photo, mode)
+                out_path, sidecar_path = self.exporter.export_photo(
+                    photo,
+                    mode,
+                    overwrite_path=existing_output_path,
+                )
                 self.history.mark_download(photo.key, mode, out_path, sidecar_path)
                 succeeded += 1
             except Exception as exc:
