@@ -38,6 +38,12 @@ MODE_LABELS = {
     MODE_BEREAL_FRONT_TL: "BeReal style (front top-left)",
     MODE_BEREAL_BACK_TL: "BeReal style (back top-left)",
 }
+MODE_FILENAME_LABELS = {
+    MODE_FRONT_ONLY: "Front Only",
+    MODE_BACK_ONLY: "Back Only",
+    MODE_BEREAL_FRONT_TL: "BeReal Front Top Left",
+    MODE_BEREAL_BACK_TL: "BeReal Back Top Left",
+}
 
 GALLERY_MAX_COLUMNS = 1
 CARD_BG_DEFAULT = "#e9ecef"
@@ -191,6 +197,10 @@ class HistoryStore:
         entry = self._data.get("entries", {}).get(photo_key, {}).get(mode)
         return entry if isinstance(entry, dict) else None
 
+    def _entry_metadata_exists(self, entry: Dict) -> bool:
+        metadata_raw = entry.get("metadataPath")
+        return isinstance(metadata_raw, str) and bool(metadata_raw) and Path(metadata_raw).exists()
+
     def _entry_output_exists(self, entry: Dict) -> bool:
         output_raw = entry.get("outputPath")
         return isinstance(output_raw, str) and bool(output_raw) and Path(output_raw).exists()
@@ -209,7 +219,7 @@ class HistoryStore:
         entry = self._get_entry(photo_key, mode)
         if entry is None:
             return False
-        if not self._entry_output_exists(entry):
+        if not self._entry_metadata_exists(entry):
             self._prune_mode(photo_key, mode)
             return False
         return True
@@ -222,7 +232,7 @@ class HistoryStore:
         modes: List[str] = []
         stale_modes: List[str] = []
         for mode, entry in photo_entry.items():
-            if not isinstance(entry, dict) or not self._entry_output_exists(entry):
+            if not isinstance(entry, dict) or not self._entry_metadata_exists(entry):
                 stale_modes.append(mode)
                 continue
             modes.append(mode)
@@ -236,14 +246,29 @@ class HistoryStore:
         entry = self._get_entry(photo_key, mode)
         if entry is None:
             return None
+        if not self._entry_metadata_exists(entry):
+            self._prune_mode(photo_key, mode)
+            return None
         output_raw = entry.get("outputPath")
         if not isinstance(output_raw, str) or not output_raw:
             return None
         output_path = Path(output_raw)
         if not output_path.exists():
-            self._prune_mode(photo_key, mode)
             return None
         return output_path
+
+    def get_metadata_path(self, photo_key: str, mode: str) -> Optional[Path]:
+        entry = self._get_entry(photo_key, mode)
+        if entry is None:
+            return None
+        metadata_raw = entry.get("metadataPath")
+        if not isinstance(metadata_raw, str) or not metadata_raw:
+            return None
+        metadata_path = Path(metadata_raw)
+        if not metadata_path.exists():
+            self._prune_mode(photo_key, mode)
+            return None
+        return metadata_path
 
     def mark_download(self, photo_key: str, mode: str, output_path: Path, sidecar_path: Path) -> None:
         entries = self._data.setdefault("entries", {})
@@ -261,7 +286,11 @@ class ImageExporter:
         self.downloads_root = downloads_root or (Path.home() / "Downloads" / "BeReal-Exports")
 
     def export_photo(
-        self, photo: MemoryPhoto, mode: str, overwrite_path: Optional[Path] = None
+        self,
+        photo: MemoryPhoto,
+        mode: str,
+        overwrite_path: Optional[Path] = None,
+        overwrite_metadata_path: Optional[Path] = None,
     ) -> Tuple[Path, Path]:
         if Image is None or ImageOps is None:
             raise RuntimeError("Pillow is not installed. Run: pip install -r requirements.txt")
@@ -275,7 +304,8 @@ class ImageExporter:
 
         output_path = overwrite_path or self._build_output_path(photo, mode)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        sidecar_path = output_path.with_suffix(".json")
+        sidecar_path = overwrite_metadata_path or self._build_metadata_path(photo, mode)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
 
         exif = Image.Exif()
         exif_dt = self._to_exif_datetime(photo.taken_time)
@@ -334,18 +364,22 @@ class ImageExporter:
         raise ValueError(f"Unsupported mode: {mode}")
 
     def planned_relative_path(self, photo: MemoryPhoto, mode: str) -> Path:
+        return Path(self.planned_filename(photo, mode))
+
+    def planned_metadata_relative_path(self, photo: MemoryPhoto, mode: str) -> Path:
         taken_dt = self._parse_iso(photo.taken_time) or datetime.now(timezone.utc)
         local_dt = taken_dt.astimezone()
         year_dir = local_dt.strftime("%Y")
         day_dir = local_dt.strftime("%Y-%m-%d")
         filename = self.planned_filename(photo, mode)
-        return Path(year_dir) / day_dir / filename
+        return Path(year_dir) / day_dir / f"{Path(filename).stem}.json"
 
     def planned_filename(self, photo: MemoryPhoto, mode: str) -> str:
         taken_dt = self._parse_iso(photo.taken_time) or datetime.now(timezone.utc)
         local_dt = taken_dt.astimezone()
-        stamp = local_dt.strftime("%Y%m%d_%H%M%S")
-        return f"{stamp}_{mode}.jpg"
+        stamp = local_dt.strftime("%Y-%m-%d %H.%M.%S")
+        mode_label = MODE_FILENAME_LABELS.get(mode, mode).replace("/", "-")
+        return f"{stamp} - {mode_label}.jpg"
 
     @staticmethod
     def _load_image(path: Path) -> "Image.Image":
@@ -407,7 +441,21 @@ class ImageExporter:
         stem = base_path.stem
         suffix = 2
         while True:
-            candidate = base_path.with_name(f"{stem}_{suffix}.jpg")
+            candidate = base_path.with_name(f"{stem} ({suffix}).jpg")
+            if not candidate.exists():
+                return candidate
+            suffix += 1
+
+    def _build_metadata_path(self, photo: MemoryPhoto, mode: str) -> Path:
+        relative = self.planned_metadata_relative_path(photo, mode)
+        base_path = self.downloads_root / relative
+        if not base_path.exists():
+            return base_path
+
+        stem = base_path.stem
+        suffix = 2
+        while True:
+            candidate = base_path.with_name(f"{stem} ({suffix}).json")
             if not candidate.exists():
                 return candidate
             suffix += 1
@@ -1756,6 +1804,10 @@ class BeRealDownloaderApp:
             photo.key: self.history.get_output_path(photo.key, mode)
             for photo in photos
         }
+        existing_metadata = {
+            photo.key: self.history.get_metadata_path(photo.key, mode)
+            for photo in photos
+        }
         existing_count = sum(1 for path in existing_outputs.values() if path is not None)
 
         if existing_count and not self.skip_existing_var.get():
@@ -1793,6 +1845,7 @@ class BeRealDownloaderApp:
                     photo,
                     mode,
                     overwrite_path=existing_output_path,
+                    overwrite_metadata_path=existing_metadata.get(photo.key),
                 )
                 self.history.mark_download(photo.key, mode, out_path, sidecar_path)
                 succeeded += 1
