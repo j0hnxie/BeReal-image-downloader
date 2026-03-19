@@ -24,6 +24,8 @@
     <string>1</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.photography</string>
+    <key>LSRequiresNativeExecution</key>
+    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>

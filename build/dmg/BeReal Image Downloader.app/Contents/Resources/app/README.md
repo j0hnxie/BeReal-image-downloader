@@ -215,6 +215,152 @@ source .venv/bin/activate
 python bereal_downloader_app.py
 ```
 
+## Make Targets
+
+This repository now includes a [Makefile](/Users/johnxie/Documents/Personal/Projects/bereal-data/Makefile) for setup, validation, app bundling, installation, and DMG creation.
+
+List available commands:
+
+```bash
+make help
+```
+
+Important targets:
+
+- `make venv`
+  - create the local virtual environment
+- `make deps`
+  - install Python dependencies into `.venv`
+- `make doctor`
+  - verify Python, `tkinter`, and Pillow
+- `make run`
+  - run the app from source
+- `make icon`
+  - build the macOS `.icns` icon from `icon.png`
+- `make app-bundle`
+  - build `dist/BeReal Image Downloader.app`
+- `make install-app`
+  - install the built app bundle into `/Applications`
+- `make uninstall-app`
+  - remove the installed app from `/Applications`
+- `make reinstall-app`
+  - uninstall and reinstall the app
+- `make open-app`
+  - open the locally built app bundle
+- `make dmg`
+  - build `dist/BeReal Image Downloader.dmg`
+- `make clean`
+  - remove generated build and dist artifacts
+- `make distclean`
+  - remove generated build artifacts and `.venv`
+
+## macOS App Bundle and Installation
+
+The Makefile builds a real macOS `.app` bundle with:
+
+- your app code
+- the generated `.icns` icon built from `icon.png`
+- an app launcher script
+- a copied version of the project virtual environment
+
+Build the app bundle:
+
+```bash
+make app-bundle
+```
+
+This creates:
+
+```text
+dist/BeReal Image Downloader.app
+```
+
+Install it into `/Applications`:
+
+```bash
+make install-app
+```
+
+After that, you can launch it from:
+
+- Finder
+- Spotlight
+- Launchpad
+- `/Applications/BeReal Image Downloader.app`
+
+Open the local built bundle without installing:
+
+```bash
+make open-app
+```
+
+Uninstall the installed app:
+
+```bash
+make uninstall-app
+```
+
+Reinstall after code changes:
+
+```bash
+make reinstall-app
+```
+
+## DMG Creation
+
+Build a DMG containing the app bundle:
+
+```bash
+make dmg
+```
+
+This creates:
+
+```text
+dist/BeReal Image Downloader.dmg
+```
+
+## Recommended Packaging Workflow
+
+For a normal local build/install cycle:
+
+```bash
+make doctor
+make app-bundle
+make install-app
+```
+
+For a distributable disk image:
+
+```bash
+make dmg
+```
+
+## Packaging Notes and Constraints
+
+The macOS app bundle is a real `.app` package, but it is not a fully standalone native binary.
+
+Current packaging model:
+
+- the app bundle includes a copy of the project `.venv`
+- that virtual environment is created from your local Python installation
+- on this machine, that means the bundle expects a working Python.org 3.13 framework-based install
+
+Practical implication:
+
+- the app should work correctly on the machine where you built it
+- if you want a fully self-contained app for redistribution to machines without that Python runtime, the next step would be packaging with a dedicated freezer such as PyInstaller or py2app
+
+## App Icon
+
+The app icon is generated from:
+
+```text
+icon.png
+```
+
+The Makefile converts it into a macOS `.icns` file automatically during `make icon`, `make app-bundle`, and `make dmg`.
+
 ## First Use
 
 1. Launch the app.

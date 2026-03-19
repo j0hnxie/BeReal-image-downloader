@@ -15,13 +15,22 @@ from typing import Dict, List, Optional, Tuple
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+PIL_IMPORT_ERROR: Optional[Exception] = None
+IMAGETK_IMPORT_ERROR: Optional[Exception] = None
+
 try:
-    from PIL import Image, ImageDraw, ImageOps, ImageTk
-except Exception:  # pragma: no cover - runtime environment dependent
+    from PIL import Image, ImageDraw, ImageOps
+except Exception as exc:  # pragma: no cover - runtime environment dependent
     Image = None
     ImageDraw = None
     ImageOps = None
+    PIL_IMPORT_ERROR = exc
+
+try:
+    from PIL import ImageTk
+except Exception as exc:  # pragma: no cover - runtime environment dependent
     ImageTk = None
+    IMAGETK_IMPORT_ERROR = exc
 
 APP_TITLE = "BeReal Image Downloader"
 APP_WIDTH = 1300
@@ -1718,12 +1727,35 @@ class BeRealDownloaderApp:
         if selected:
             self.path_var.set(selected)
 
-    def on_load_data(self) -> None:
-        if Image is None or ImageOps is None or ImageTk is None:
+    def _show_imaging_dependency_error(self) -> None:
+        if Image is None or ImageOps is None:
+            detail = f"\n\nImport error:\n{PIL_IMPORT_ERROR}" if PIL_IMPORT_ERROR is not None else ""
             messagebox.showerror(
                 "Missing dependency",
-                "Pillow is required. Install it with:\n\npython3 -m pip install -r requirements.txt",
+                (
+                    "The app could not import Pillow's core image modules.\n\n"
+                    "If you are running from source, install dependencies with:\n\n"
+                    "python3 -m pip install -r requirements.txt"
+                    f"{detail}"
+                ),
             )
+            return
+
+        detail = f"\n\nImport error:\n{IMAGETK_IMPORT_ERROR}" if IMAGETK_IMPORT_ERROR is not None else ""
+        messagebox.showerror(
+            "Imaging setup problem",
+            (
+                "The app could import Pillow, but it could not load Pillow's Tk image bridge "
+                "(`ImageTk`).\n\n"
+                "If you are launching the installed app bundle, rebuild and reinstall it with:\n\n"
+                "make app-bundle\nmake install-app"
+                f"{detail}"
+            ),
+        )
+
+    def on_load_data(self) -> None:
+        if Image is None or ImageOps is None or ImageTk is None:
+            self._show_imaging_dependency_error()
             return
 
         try:
