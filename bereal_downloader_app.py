@@ -581,6 +581,7 @@ class BeRealDownloaderApp:
 
         self._build_ui()
         self._configure_row_tags()
+        self.root.after(0, self._focus_main_window_on_start)
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=10)
@@ -1587,6 +1588,20 @@ class BeRealDownloaderApp:
         except Exception:
             pass
         win.focus_force()
+
+    def _focus_main_window_on_start(self) -> None:
+        try:
+            self.root.update_idletasks()
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(
+                40,
+                lambda: self.root.attributes("-topmost", False) if self.root.winfo_exists() else None,
+            )
+            self.root.focus_force()
+        except Exception:
+            pass
 
     def open_photo_preview_window(self, photo: MemoryPhoto, show_errors: bool = True) -> None:
         if self.preview_nav_after_id is not None:
