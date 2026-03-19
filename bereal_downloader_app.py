@@ -4,8 +4,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,13 +17,22 @@ from typing import Dict, List, Optional, Tuple
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+PIL_IMPORT_ERROR: Optional[Exception] = None
+IMAGETK_IMPORT_ERROR: Optional[Exception] = None
+
 try:
-    from PIL import Image, ImageDraw, ImageOps, ImageTk
-except Exception:  # pragma: no cover - runtime environment dependent
+    from PIL import Image, ImageDraw, ImageOps
+except Exception as exc:  # pragma: no cover - runtime environment dependent
     Image = None
     ImageDraw = None
     ImageOps = None
+    PIL_IMPORT_ERROR = exc
+
+try:
+    from PIL import ImageTk
+except Exception as exc:  # pragma: no cover - runtime environment dependent
     ImageTk = None
+    IMAGETK_IMPORT_ERROR = exc
 
 APP_TITLE = "BeReal Image Downloader"
 APP_WIDTH = 1300
@@ -578,10 +589,60 @@ class BeRealDownloaderApp:
         self.preview_info_label: Optional[tk.Label] = None
         self.preview_nav_after_id: Optional[str] = None
         self.preview_nav_pending_index: Optional[int] = None
+        self.app_icon_photo: Optional[tk.PhotoImage] = None
+        self.download_progress_window: Optional[tk.Toplevel] = None
+        self.download_progress_bar: Optional[ttk.Progressbar] = None
+        self.download_progress_title_var = tk.StringVar(value="")
+        self.download_progress_detail_var = tk.StringVar(value="")
+        self.download_progress_counts_var = tk.StringVar(value="")
+        self.download_queue: Optional[queue.Queue] = None
+        self.download_poll_after_id: Optional[str] = None
+        self.download_state: Optional[Dict[str, object]] = None
 
+        self._configure_app_identity()
         self._build_ui()
         self._configure_row_tags()
         self.root.after(0, self._focus_main_window_on_start)
+
+    def _configure_app_identity(self) -> None:
+        try:
+            self.root.iconname(APP_TITLE)
+        except Exception:
+            pass
+        try:
+            self.root.tk.call("tk", "appname", APP_TITLE)
+        except Exception:
+            pass
+
+        icon_path = self._resolve_app_asset_path("icon.png")
+        if icon_path is None:
+            return
+
+        try:
+            self.app_icon_photo = tk.PhotoImage(file=str(icon_path))
+            self.root.iconphoto(True, self.app_icon_photo)
+        except Exception:
+            self.app_icon_photo = None
+
+    def _resolve_app_asset_path(self, name: str) -> Optional[Path]:
+        script_dir = Path(__file__).resolve().parent
+        candidates = [
+            script_dir / name,
+            script_dir.parent / name,
+            Path.cwd() / name,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _set_window_icon(self, win: tk.Toplevel) -> None:
+        if self.app_icon_photo is None:
+            return
+        try:
+            win.iconphoto(True, self.app_icon_photo)
+        except Exception:
+            pass
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=10)
@@ -1544,6 +1605,210 @@ class BeRealDownloaderApp:
         y = root_y + (root_h - win_h) // 2
         win.geometry(f"+{max(0, x)}+{max(0, y)}")
 
+    def _show_modal_dialog(
+        self,
+        title: str,
+        message: str,
+        kind: str = "info",
+        detail: str = "",
+        buttons: Tuple[str, ...] = ("OK",),
+        default: Optional[str] = None,
+    ) -> str:
+        colors = {
+            "info": "#111111",
+            "warning": "#8a4b00",
+            "error": "#9f1111",
+        }
+        accent = colors.get(kind, "#111111")
+        chosen = {"value": default or buttons[0]}
+
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title(title)
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.configure(bg="#f5f5f5")
+        self._set_window_icon(win)
+
+        header = tk.Frame(win, bg=accent, height=8)
+        header.pack(fill=tk.X)
+
+        body = tk.Frame(win, bg="#f5f5f5", padx=22, pady=18)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        title_label = tk.Label(
+            body,
+            text=title,
+            bg="#f5f5f5",
+            fg="#111111",
+            font=("Helvetica", 16, "bold"),
+            anchor="w",
+            justify=tk.LEFT,
+        )
+        title_label.pack(fill=tk.X)
+
+        message_label = tk.Label(
+            body,
+            text=message,
+            bg="#f5f5f5",
+            fg="#111111",
+            font=("Helvetica", 12),
+            wraplength=500,
+            justify=tk.LEFT,
+            anchor="w",
+            pady=10,
+        )
+        message_label.pack(fill=tk.X)
+
+        if detail:
+            detail_label = tk.Label(
+                body,
+                text=detail,
+                bg="#f5f5f5",
+                fg="#444444",
+                font=("Menlo", 10),
+                wraplength=500,
+                justify=tk.LEFT,
+                anchor="w",
+            )
+            detail_label.pack(fill=tk.X, pady=(0, 8))
+
+        button_row = tk.Frame(body, bg="#f5f5f5")
+        button_row.pack(fill=tk.X, pady=(8, 0))
+
+        def close_with(value: str) -> None:
+            chosen["value"] = value
+            win.destroy()
+
+        for label in reversed(buttons):
+            is_default = label == (default or buttons[0])
+            btn = tk.Button(
+                button_row,
+                text=label,
+                command=lambda value=label: close_with(value),
+                relief=tk.FLAT,
+                bd=0,
+                padx=16,
+                pady=8,
+                font=("Helvetica", 11, "bold" if is_default else "normal"),
+                bg="#111111" if is_default else "#e7e7e7",
+                fg="#ffffff" if is_default else "#111111",
+                activebackground="#222222" if is_default else "#d9d9d9",
+                activeforeground="#ffffff" if is_default else "#111111",
+                cursor="hand2",
+            )
+            btn.pack(side=tk.RIGHT, padx=(8, 0))
+            if is_default:
+                btn.focus_set()
+
+        win.protocol("WM_DELETE_WINDOW", lambda: close_with(default or buttons[0]))
+        win.bind("<Return>", lambda _event: close_with(default or buttons[0]))
+        if len(buttons) > 1:
+            win.bind("<Escape>", lambda _event: close_with(buttons[-1]))
+
+        self._center_window_over_root(win)
+        win.deiconify()
+        win.grab_set()
+        self._raise_preview_window(win)
+        self.root.wait_window(win)
+        return str(chosen["value"])
+
+    def _show_info_dialog(self, title: str, message: str, detail: str = "") -> None:
+        self._show_modal_dialog(title, message, kind="info", detail=detail)
+
+    def _show_warning_dialog(self, title: str, message: str, detail: str = "") -> None:
+        self._show_modal_dialog(title, message, kind="warning", detail=detail)
+
+    def _show_error_dialog(self, title: str, message: str, detail: str = "") -> None:
+        self._show_modal_dialog(title, message, kind="error", detail=detail)
+
+    def _ask_confirm_dialog(self, title: str, message: str, detail: str = "") -> bool:
+        choice = self._show_modal_dialog(
+            title,
+            message,
+            kind="warning",
+            detail=detail,
+            buttons=("Continue", "Cancel"),
+            default="Continue",
+        )
+        return choice == "Continue"
+
+    def _open_download_progress(self, total: int, mode_label: str) -> None:
+        self._close_download_progress()
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title("Downloading BeReals")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.configure(bg="#f5f5f5")
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        self._set_window_icon(win)
+
+        body = tk.Frame(win, bg="#f5f5f5", padx=22, pady=18)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            body,
+            text="Downloading BeReals",
+            bg="#f5f5f5",
+            fg="#111111",
+            font=("Helvetica", 16, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X)
+
+        self.download_progress_title_var.set(f"Preparing {total} export(s) in {mode_label}")
+        tk.Label(
+            body,
+            textvariable=self.download_progress_title_var,
+            bg="#f5f5f5",
+            fg="#111111",
+            font=("Helvetica", 12),
+            anchor="w",
+            pady=10,
+        ).pack(fill=tk.X)
+
+        progress = ttk.Progressbar(body, mode="determinate", maximum=max(1, total), length=440)
+        progress.pack(fill=tk.X)
+        self.download_progress_bar = progress
+
+        self.download_progress_detail_var.set("Starting...")
+        tk.Label(
+            body,
+            textvariable=self.download_progress_detail_var,
+            bg="#f5f5f5",
+            fg="#333333",
+            font=("Helvetica", 11),
+            anchor="w",
+            pady=10,
+        ).pack(fill=tk.X)
+
+        self.download_progress_counts_var.set("Success: 0    Skipped: 0    Failed: 0")
+        tk.Label(
+            body,
+            textvariable=self.download_progress_counts_var,
+            bg="#f5f5f5",
+            fg="#555555",
+            font=("Helvetica", 10),
+            anchor="w",
+        ).pack(fill=tk.X)
+
+        self._center_window_over_root(win)
+        win.deiconify()
+        win.grab_set()
+        self._raise_preview_window(win)
+        self.download_progress_window = win
+
+    def _close_download_progress(self) -> None:
+        if self.download_progress_window is not None:
+            try:
+                if self.download_progress_window.winfo_exists():
+                    self.download_progress_window.grab_release()
+                    self.download_progress_window.destroy()
+            except Exception:
+                pass
+        self.download_progress_window = None
+        self.download_progress_bar = None
+
     def _render_preview_image(self, photo: MemoryPhoto, mode: str, max_w: int, max_h: int) -> "Image.Image":
         source_max_side = min(2200, max(900, int(max(max_w, max_h) * 1.25)))
         downloaded_output = self.history.get_output_path(photo.key, mode)
@@ -1620,7 +1885,7 @@ class BeRealDownloaderApp:
             img = self._render_preview_image(photo, mode, max_w, max_h)
         except Exception as exc:
             if show_errors:
-                messagebox.showerror("Preview failed", str(exc))
+                self._show_error_dialog("Preview failed", str(exc))
             return
 
         photo_img = ImageTk.PhotoImage(img)
@@ -1718,12 +1983,35 @@ class BeRealDownloaderApp:
         if selected:
             self.path_var.set(selected)
 
+    def _show_imaging_dependency_error(self) -> None:
+        if Image is None or ImageOps is None:
+            detail = f"\n\nImport error:\n{PIL_IMPORT_ERROR}" if PIL_IMPORT_ERROR is not None else ""
+            self._show_error_dialog(
+                "Missing dependency",
+                (
+                    "The app could not import Pillow's core image modules.\n\n"
+                    "If you are running from source, install dependencies with:\n\n"
+                    "python3 -m pip install -r requirements.txt"
+                ),
+                detail=detail.strip(),
+            )
+            return
+
+        detail = f"\n\nImport error:\n{IMAGETK_IMPORT_ERROR}" if IMAGETK_IMPORT_ERROR is not None else ""
+        self._show_error_dialog(
+            "Imaging setup problem",
+            (
+                "The app could import Pillow, but it could not load Pillow's Tk image bridge "
+                "(`ImageTk`).\n\n"
+                "If you are launching the installed app bundle, rebuild and reinstall it with:\n\n"
+                "make app-bundle\nmake install-app"
+            ),
+            detail=detail.strip(),
+        )
+
     def on_load_data(self) -> None:
         if Image is None or ImageOps is None or ImageTk is None:
-            messagebox.showerror(
-                "Missing dependency",
-                "Pillow is required. Install it with:\n\npython3 -m pip install -r requirements.txt",
-            )
+            self._show_imaging_dependency_error()
             return
 
         try:
@@ -1731,7 +2019,7 @@ class BeRealDownloaderApp:
             export_dir = self.loader.find_export_dir(base)
             photos = self.loader.load_memories(export_dir)
         except Exception as exc:
-            messagebox.showerror("Load failed", str(exc))
+            self._show_error_dialog("Load failed", str(exc))
             return
 
         self.export_dir = export_dir
@@ -1802,18 +2090,21 @@ class BeRealDownloaderApp:
             photos = [self.photo_by_item[item] for item in selected_items if item in self.photo_by_item]
 
         if not photos:
-            messagebox.showinfo("Nothing selected", "Select one or more rows in the table or scroller.")
+            self._show_info_dialog("Nothing selected", "Select one or more rows in the table or scroller.")
             return
 
         self._download_photos(photos)
 
     def on_download_all(self) -> None:
         if not self.photos:
-            messagebox.showinfo("No data", "Load export data first.")
+            self._show_info_dialog("No data", "Load export data first.")
             return
         self._download_photos(self.photos)
 
     def _download_photos(self, photos: List[MemoryPhoto]) -> None:
+        if self.download_state is not None:
+            return
+
         mode = self.mode_var.get()
         existing_outputs = {
             photo.key: self.history.get_output_path(photo.key, mode)
@@ -1827,32 +2118,60 @@ class BeRealDownloaderApp:
 
         if existing_count and not self.skip_existing_var.get():
             mode_label = MODE_LABELS.get(mode, mode)
-            should_overwrite = messagebox.askyesno(
+            should_overwrite = self._ask_confirm_dialog(
                 "Confirm overwrite",
-                (
-                    f"{existing_count} selected export(s) already exist for {mode_label}.\n\n"
-                    "Overwrite the existing image and metadata files?"
-                ),
+                f"{existing_count} selected export(s) already exist for {mode_label}.",
+                detail="Overwrite the existing image and metadata files?",
             )
             if not should_overwrite:
                 self.status_var.set("Overwrite canceled.")
                 return
 
-        succeeded = 0
-        skipped = 0
-        failed = 0
-        errors: List[str] = []
-
         total = len(photos)
+        mode_label = MODE_LABELS.get(mode, mode)
+        self._open_download_progress(total, mode_label)
+        self.status_var.set(f"Exporting 0/{total}...")
 
+        event_queue: queue.Queue = queue.Queue()
+        self.download_queue = event_queue
+        self.download_state = {
+            "mode": mode,
+            "total": total,
+            "succeeded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "errors": [],
+        }
+
+        worker = threading.Thread(
+            target=self._download_worker,
+            args=(
+                photos,
+                mode,
+                bool(self.skip_existing_var.get()),
+                existing_outputs,
+                existing_metadata,
+                event_queue,
+            ),
+            daemon=True,
+        )
+        worker.start()
+        self.download_poll_after_id = self.root.after(30, self._poll_download_queue)
+
+    def _download_worker(
+        self,
+        photos: List[MemoryPhoto],
+        mode: str,
+        skip_existing: bool,
+        existing_outputs: Dict[str, Optional[Path]],
+        existing_metadata: Dict[str, Optional[Path]],
+        event_queue: "queue.Queue[Dict[str, object]]",
+    ) -> None:
+        total = len(photos)
         for i, photo in enumerate(photos, start=1):
-            self.status_var.set(f"Exporting {i}/{total}...")
-            self.root.update_idletasks()
-
             existing_output_path = existing_outputs.get(photo.key)
-
-            if self.skip_existing_var.get() and existing_output_path is not None:
-                skipped += 1
+            if skip_existing and existing_output_path is not None:
+                event_queue.put({"type": "skipped", "index": i, "total": total, "photo": photo})
                 continue
 
             try:
@@ -1862,25 +2181,114 @@ class BeRealDownloaderApp:
                     overwrite_path=existing_output_path,
                     overwrite_metadata_path=existing_metadata.get(photo.key),
                 )
-                self.history.mark_download(photo.key, mode, out_path, sidecar_path)
-                succeeded += 1
+                event_queue.put(
+                    {
+                        "type": "success",
+                        "index": i,
+                        "total": total,
+                        "photo": photo,
+                        "output_path": out_path,
+                        "sidecar_path": sidecar_path,
+                    }
+                )
             except Exception as exc:
-                failed += 1
-                errors.append(f"{photo.taken_time}: {exc}")
+                event_queue.put(
+                    {
+                        "type": "failed",
+                        "index": i,
+                        "total": total,
+                        "photo": photo,
+                        "error": str(exc),
+                    }
+                )
+
+        event_queue.put({"type": "done"})
+
+    def _poll_download_queue(self) -> None:
+        if self.download_queue is None or self.download_state is None:
+            return
+
+        while True:
+            try:
+                event = self.download_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            event_type = str(event.get("type"))
+            if event_type == "done":
+                self._finish_download_run()
+                return
+
+            index = int(event.get("index", 0))
+            total = int(event.get("total", 0))
+            photo = event.get("photo")
+            photo_time = self._format_time(photo.taken_time) if isinstance(photo, MemoryPhoto) else ""
+
+            if event_type == "success":
+                output_path = event.get("output_path")
+                sidecar_path = event.get("sidecar_path")
+                if isinstance(photo, MemoryPhoto) and isinstance(output_path, Path) and isinstance(sidecar_path, Path):
+                    self.history.mark_download(photo.key, str(self.download_state["mode"]), output_path, sidecar_path)
+                self.download_state["succeeded"] = int(self.download_state["succeeded"]) + 1
+                action = "Saved"
+            elif event_type == "skipped":
+                self.download_state["skipped"] = int(self.download_state["skipped"]) + 1
+                action = "Skipped"
+            else:
+                self.download_state["failed"] = int(self.download_state["failed"]) + 1
+                error = str(event.get("error", "Unknown error"))
+                errors = self.download_state["errors"]
+                if isinstance(errors, list):
+                    errors.append(f"{photo_time or 'Unknown time'}: {error}")
+                action = "Failed"
+
+            if self.download_progress_bar is not None:
+                self.download_progress_bar.configure(value=index)
+            self.download_progress_title_var.set(
+                f"Exporting {index}/{total} in {MODE_LABELS.get(str(self.download_state['mode']), str(self.download_state['mode']))}"
+            )
+            self.download_progress_detail_var.set(f"{action}: {photo_time or 'Unknown capture time'}")
+            self.download_progress_counts_var.set(
+                "Success: "
+                f"{self.download_state['succeeded']}    "
+                f"Skipped: {self.download_state['skipped']}    "
+                f"Failed: {self.download_state['failed']}"
+            )
+            self.status_var.set(f"Exporting {index}/{total}...")
+
+        self.download_poll_after_id = self.root.after(30, self._poll_download_queue)
+
+    def _finish_download_run(self) -> None:
+        if self.download_poll_after_id is not None:
+            try:
+                self.root.after_cancel(self.download_poll_after_id)
+            except Exception:
+                pass
+        self.download_poll_after_id = None
+
+        state = self.download_state or {}
+        self.download_queue = None
+        self.download_state = None
 
         self.history.save()
         self.refresh_table()
         self.request_scroller_refresh()
+        self._close_download_progress()
 
-        summary = f"Done. Success: {succeeded}, Skipped: {skipped}, Failed: {failed}"
+        summary = (
+            f"Done. Success: {int(state.get('succeeded', 0))}, "
+            f"Skipped: {int(state.get('skipped', 0))}, "
+            f"Failed: {int(state.get('failed', 0))}"
+        )
         self.status_var.set(summary)
 
-        if failed:
+        errors = state.get("errors", [])
+        if isinstance(errors, list) and errors:
             preview = "\n".join(errors[:10])
             more = "" if len(errors) <= 10 else f"\n...and {len(errors) - 10} more"
-            messagebox.showwarning("Completed with errors", f"{summary}\n\n{preview}{more}")
+            self._show_warning_dialog("Completed with errors", summary, detail=f"{preview}{more}".strip())
         else:
-            messagebox.showinfo("Completed", summary)
+            self._show_info_dialog("Completed", summary)
 
     def on_open_output(self) -> None:
         output_dir = self.exporter.downloads_root

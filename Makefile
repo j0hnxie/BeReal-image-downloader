@@ -76,7 +76,7 @@ app-bundle: deps icon
 	cp packaging/launcher.sh "$(APP_EXECUTABLE)"
 	chmod +x "$(APP_EXECUTABLE)"
 	cp "$(ICNS_PATH)" "$(APP_RESOURCES)/AppIcon.icns"
-	cp bereal_downloader_app.py requirements.txt README.md "$(APP_RESOURCES)/app/"
+	cp bereal_downloader_app.py requirements.txt README.md icon.png "$(APP_RESOURCES)/app/"
 	ditto "$(VENV_DIR)" "$(APP_RESOURCES)/venv"
 
 install-app: app-bundle
