@@ -1615,12 +1615,6 @@ class BeRealDownloaderApp:
         buttons: Tuple[str, ...] = ("OK",),
         default: Optional[str] = None,
     ) -> str:
-        colors = {
-            "info": "#d9d9d9",
-            "warning": "#ecd7b1",
-            "error": "#f1d0d0",
-        }
-        accent = colors.get(kind, "#111111")
         chosen = {"value": default or buttons[0]}
 
         win = tk.Toplevel(self.root)
@@ -1628,30 +1622,27 @@ class BeRealDownloaderApp:
         win.title(title)
         win.transient(self.root)
         win.resizable(False, False)
-        win.configure(bg="#f5f5f5")
+        win.configure(bg="#ececec")
         self._set_window_icon(win)
 
-        body = tk.Frame(win, bg="#f5f5f5", padx=24, pady=20)
+        body = tk.Frame(win, bg="#ececec", padx=24, pady=20)
         body.pack(fill=tk.BOTH, expand=True)
-
-        header = tk.Frame(body, bg=accent, height=10)
-        header.pack(fill=tk.X, pady=(0, 14))
 
         title_label = tk.Label(
             body,
             text=title,
-            bg="#f5f5f5",
+            bg="#ececec",
             fg="#111111",
-            font=("Helvetica", 16, "bold"),
+            font=("Helvetica", 15, "bold"),
             anchor="center",
             justify=tk.CENTER,
         )
-        title_label.pack(fill=tk.X)
+        title_label.pack(fill=tk.X, pady=(0, 6))
 
         message_label = tk.Label(
             body,
             text=message,
-            bg="#f5f5f5",
+            bg="#ececec",
             fg="#111111",
             font=("Helvetica", 12),
             wraplength=500,
@@ -1664,23 +1655,24 @@ class BeRealDownloaderApp:
             detail_label = tk.Label(
                 body,
                 text=detail,
-                bg="#f5f5f5",
-                fg="#444444",
-                font=("Menlo", 10),
+                bg="#ececec",
+                fg="#4f4f4f",
+                font=("Helvetica", 10),
                 wraplength=500,
                 justify=tk.CENTER,
                 anchor="center",
             )
             detail_label.pack(fill=tk.X, pady=(2, 10))
 
-        button_row = tk.Frame(body, bg="#f5f5f5")
+        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(6, 12))
+
+        button_row = tk.Frame(body, bg="#ececec")
         button_row.pack(fill=tk.X, pady=(8, 0))
 
         def close_with(value: str) -> None:
             chosen["value"] = value
             win.destroy()
 
-        created_buttons: List[ttk.Button] = []
         for label in buttons:
             is_default = label == (default or buttons[0])
             btn = ttk.Button(
@@ -1691,7 +1683,6 @@ class BeRealDownloaderApp:
                 default=tk.ACTIVE if is_default else tk.NORMAL,
             )
             btn.pack(side=tk.LEFT, expand=True, padx=6)
-            created_buttons.append(btn)
             if is_default:
                 btn.focus_set()
 
@@ -1735,28 +1726,27 @@ class BeRealDownloaderApp:
         win.title("Downloading BeReals")
         win.transient(self.root)
         win.resizable(False, False)
-        win.configure(bg="#f5f5f5")
+        win.configure(bg="#ececec")
         win.protocol("WM_DELETE_WINDOW", self._request_cancel_download)
         self._set_window_icon(win)
 
-        body = tk.Frame(win, bg="#f5f5f5", padx=24, pady=20)
+        body = tk.Frame(win, bg="#ececec", padx=24, pady=20)
         body.pack(fill=tk.BOTH, expand=True)
 
-        tk.Frame(body, bg="#d9d9d9", height=10).pack(fill=tk.X, pady=(0, 14))
         tk.Label(
             body,
             text="Downloading BeReals",
-            bg="#f5f5f5",
+            bg="#ececec",
             fg="#111111",
-            font=("Helvetica", 16, "bold"),
+            font=("Helvetica", 15, "bold"),
             anchor="center",
-        ).pack(fill=tk.X)
+        ).pack(fill=tk.X, pady=(0, 6))
 
         self.download_progress_title_var.set(f"Preparing {total} export(s) in {mode_label}")
         tk.Label(
             body,
             textvariable=self.download_progress_title_var,
-            bg="#f5f5f5",
+            bg="#ececec",
             fg="#111111",
             font=("Helvetica", 12),
             anchor="center",
@@ -1770,7 +1760,7 @@ class BeRealDownloaderApp:
         tk.Label(
             body,
             textvariable=self.download_progress_detail_var,
-            bg="#f5f5f5",
+            bg="#ececec",
             fg="#333333",
             font=("Helvetica", 11),
             anchor="center",
@@ -1781,13 +1771,15 @@ class BeRealDownloaderApp:
         tk.Label(
             body,
             textvariable=self.download_progress_counts_var,
-            bg="#f5f5f5",
+            bg="#ececec",
             fg="#555555",
             font=("Helvetica", 10),
             anchor="center",
         ).pack(fill=tk.X)
 
-        button_row = tk.Frame(body, bg="#f5f5f5")
+        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(12, 12))
+
+        button_row = tk.Frame(body, bg="#ececec")
         button_row.pack(fill=tk.X, pady=(14, 0))
         ttk.Button(button_row, text="Cancel Download", command=self._request_cancel_download).pack(
             side=tk.LEFT, expand=True

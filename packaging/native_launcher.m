@@ -1,8 +1,7 @@
 #import <Foundation/Foundation.h>
-#include <errno.h>
+#include <Python.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 
 static NSString *findFirstMatchingDirectory(NSString *rootPath) {
@@ -54,6 +53,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        [[NSProcessInfo processInfo] setProcessName:@"BeReal Image Downloader"];
         unsetenv("PYTHONHOME");
         setenv("PYTHONNOUSERSITE", "1", 1);
         setenv("__PYVENV_LAUNCHER__", [venvPython UTF8String], 1);
@@ -64,13 +64,50 @@ int main(int argc, char *argv[]) {
             chdir(home);
         }
 
-        char *pythonArgv[] = {
-            "BeReal Image Downloader",
-            (char *)[scriptPath fileSystemRepresentation],
-            NULL,
-        };
-        execv([venvPython fileSystemRepresentation], pythonArgv);
-        fprintf(stderr, "Failed to launch bundled Python runtime: %s\n", strerror(errno));
+        PyStatus status;
+        PyConfig config;
+        PyConfig_InitPythonConfig(&config);
+
+        wchar_t *venvPythonWide = Py_DecodeLocale([venvPython fileSystemRepresentation], NULL);
+        wchar_t *scriptWide = Py_DecodeLocale([scriptPath fileSystemRepresentation], NULL);
+        if (venvPythonWide == NULL || scriptWide == NULL) {
+            fprintf(stderr, "Failed to decode launcher paths for Python runtime\n");
+            PyMem_RawFree(venvPythonWide);
+            PyMem_RawFree(scriptWide);
+            return 1;
+        }
+
+        status = PyConfig_SetString(&config, &config.program_name, venvPythonWide);
+        if (PyStatus_Exception(status)) {
+            goto python_fail;
+        }
+        status = PyConfig_SetString(&config, &config.executable, venvPythonWide);
+        if (PyStatus_Exception(status)) {
+            goto python_fail;
+        }
+        status = PyConfig_SetString(&config, &config.run_filename, scriptWide);
+        if (PyStatus_Exception(status)) {
+            goto python_fail;
+        }
+
+        config.parse_argv = 0;
+        config.install_signal_handlers = 1;
+
+        status = Py_InitializeFromConfig(&config);
+        if (PyStatus_Exception(status)) {
+            goto python_fail;
+        }
+
+        PyConfig_Clear(&config);
+        PyMem_RawFree(venvPythonWide);
+        PyMem_RawFree(scriptWide);
+        return Py_RunMain();
+
+python_fail:
+        PyConfig_Clear(&config);
+        PyMem_RawFree(venvPythonWide);
+        PyMem_RawFree(scriptWide);
+        Py_ExitStatusException(status);
         return 1;
     }
 }
