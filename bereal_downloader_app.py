@@ -8,6 +8,7 @@ import queue
 import subprocess
 import sys
 import threading
+import textwrap
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,6 +38,8 @@ except Exception as exc:  # pragma: no cover - runtime environment dependent
 APP_TITLE = "BeReal Image Downloader"
 APP_WIDTH = 1300
 APP_HEIGHT = 760
+APP_MIN_WIDTH = 980
+APP_MIN_HEIGHT = 700
 
 MODE_FRONT_ONLY = "front_only"
 MODE_BACK_ONLY = "back_only"
@@ -56,7 +59,11 @@ MODE_FILENAME_LABELS = {
     MODE_BEREAL_BACK_TL: "BeReal Back Top Left",
 }
 
-GALLERY_MAX_COLUMNS = 1
+GALLERY_MAX_COLUMNS = 6
+GALLERY_MEDIUM_COLUMNS = 5
+GALLERY_MIN_COLUMNS = 4
+GALLERY_FIVE_COLUMN_BREAKPOINT = 930
+GALLERY_SIX_COLUMN_BREAKPOINT = 1100
 CARD_BG_DEFAULT = "#e9ecef"
 CARD_BG_SELECTED = "#cfe8ff"
 CARD_BG_MISSING = "#ffe9e9"
@@ -65,10 +72,16 @@ META_UI_FG = "#ffffff"
 PREVIEW_TEXT_FG = "#000000"
 CARD_HIGHLIGHT_SELECTED = "#111111"
 CARD_HIGHLIGHT_MISSING = "#c86b6b"
-PREVIEW_ZOOM_MIN = 0.0035
-PREVIEW_ZOOM_MAX = 1.4
-PREVIEW_ZOOM_DEFAULT = 0.35
+GRID_THUMB_MIN_WIDTH = 96
+GRID_THUMB_MAX_WIDTH = 158
+GRID_THUMB_HEIGHT_RATIO = 1.35
+GALLERY_INITIAL_BATCH = 72
+GALLERY_BATCH_SIZE = 48
+GALLERY_PREFETCH_VIEWPORTS = 1.75
 PREVIEW_NAV_DEBOUNCE_MS = 45
+BEREAL_INSET_ASPECT = 0.75
+BEREAL_INSET_HEIGHT_RATIO = 0.416
+BEREAL_INSET_MARGIN_RATIO = 0.028
 
 
 @dataclass
@@ -373,7 +386,7 @@ class ImageExporter:
         if mode == MODE_BEREAL_FRONT_TL:
             return self._compose(base=back, inset=front)
         if mode == MODE_BEREAL_BACK_TL:
-            return self._compose(base=front, inset=back)
+            return self._compose(base=front, inset=back, canvas_reference=back)
 
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -402,13 +415,30 @@ class ImageExporter:
         return img.convert("RGB")
 
     @staticmethod
-    def _compose(base: "Image.Image", inset: "Image.Image") -> "Image.Image":
+    def _compose(
+        base: "Image.Image",
+        inset: "Image.Image",
+        canvas_reference: Optional["Image.Image"] = None,
+    ) -> "Image.Image":
         if ImageDraw is None:
             raise RuntimeError("Pillow ImageDraw support is required for BeReal composition.")
 
-        composed = base.copy()
-        inset_target_w = max(140, int(composed.width * 0.315))
-        inset_target_h = max(140, int(composed.height * 0.315))
+        output_reference = canvas_reference or base
+        composed = ImageOps.fit(
+            base.copy(),
+            output_reference.size,
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+        reference_side = min(composed.width, composed.height)
+        margin = max(13, int(reference_side * BEREAL_INSET_MARGIN_RATIO))
+        inset_target_h = max(176, int(reference_side * BEREAL_INSET_HEIGHT_RATIO))
+        inset_target_w = max(110, int(inset_target_h * BEREAL_INSET_ASPECT))
+        max_inset_w = max(96, composed.width - (margin * 2) - 4)
+        max_inset_h = max(120, composed.height - (margin * 2) - 4)
+        scale = min(1.0, max_inset_w / inset_target_w, max_inset_h / inset_target_h)
+        inset_target_w = max(96, int(inset_target_w * scale))
+        inset_target_h = max(120, int(inset_target_h * scale))
         inset_copy = inset.copy()
         inset_copy = ImageOps.fit(
             inset_copy,
@@ -417,7 +447,7 @@ class ImageExporter:
             centering=(0.5, 0.5),
         )
 
-        border = max(2, int(composed.width * 0.004))
+        border = max(2, int(reference_side * 0.004))
         radius = max(12, int(min(inset_target_w, inset_target_h) * 0.12))
         framed_w = inset_target_w + border * 2
         framed_h = inset_target_h + border * 2
@@ -440,7 +470,6 @@ class ImageExporter:
         inset_rgba = inset_copy.convert("RGBA")
         framed.paste(inset_rgba, (border, border), inset_mask)
 
-        margin = max(10, int(composed.width * 0.028))
         composed_rgba = composed.convert("RGBA")
         composed_rgba.alpha_composite(framed, dest=(margin, margin))
         composed = composed_rgba.convert("RGB")
@@ -539,6 +568,7 @@ class BeRealDownloaderApp:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry(f"{APP_WIDTH}x{APP_HEIGHT}")
+        self.root.minsize(APP_MIN_WIDTH, APP_MIN_HEIGHT)
 
         self.loader = ExportDataLoader()
         self.history = HistoryStore()
@@ -553,10 +583,6 @@ class BeRealDownloaderApp:
         self.mode_var = tk.StringVar(value=MODE_BEREAL_FRONT_TL)
         self.show_all_metadata_var = tk.BooleanVar(value=False)
         self.skip_existing_var = tk.BooleanVar(value=True)
-        self.preview_zoom = PREVIEW_ZOOM_DEFAULT
-        self.zoom_label_var = tk.StringVar(value=f"{self._display_zoom_percent()}%")
-        self.zoom_percent_var = tk.StringVar(value=str(self._display_zoom_percent()))
-        self.zoom_scale_var = tk.DoubleVar(value=float(self._display_zoom_percent()))
         self.status_var = tk.StringVar(value="Select an export folder and click Load Data.")
         self.selection_status_var = tk.StringVar(value="Selected: 0")
 
@@ -568,6 +594,20 @@ class BeRealDownloaderApp:
         self.selection_focus_index: Optional[int] = None
 
         self.scroller_container: Optional[ttk.Frame] = None
+        self.scroller_grid_frame: Optional[ttk.Frame] = None
+        self.scroller_detail_frame: Optional[ttk.Frame] = None
+        self.scroller_detail_image_label: Optional[tk.Canvas] = None
+        self.scroller_detail_title_var = tk.StringVar(value="")
+        self.scroller_detail_info_var = tk.StringVar(value="")
+        self.scroller_detail_mode: bool = False
+        self.scroller_detail_index: Optional[int] = None
+        self.scroller_detail_canvas_items: Dict[str, int] = {}
+        self.scroller_detail_meta_overlay: Optional[tk.Frame] = None
+        self.scroller_detail_meta_label: Optional[tk.Label] = None
+        self.scroller_detail_meta_visible: bool = False
+        self.scroller_detail_meta_after_id: Optional[str] = None
+        self.scroller_detail_image_bounds: Tuple[int, int, int, int] = (0, 0, 0, 0)
+        self.scroller_detail_drag_start: Optional[Tuple[int, int]] = None
         self.notebook: Optional[ttk.Notebook] = None
         self.table_tab: Optional[ttk.Frame] = None
         self.scroller_tab: Optional[ttk.Frame] = None
@@ -576,10 +616,19 @@ class BeRealDownloaderApp:
         self.gallery_inner: Optional[tk.Frame] = None
         self.gallery_scrollbar: Optional[ttk.Scrollbar] = None
         self.gallery_window_id: Optional[int] = None
+        self.gallery_footer: Optional[ttk.Frame] = None
+        self.gallery_footer_label_var = tk.StringVar(value="")
+        self.gallery_footer_progress: Optional[ttk.Progressbar] = None
+        self.gallery_loading_overlay: Optional[ttk.Frame] = None
+        self.gallery_loading_overlay_progress: Optional[ttk.Progressbar] = None
+        self.gallery_initial_loading_active: bool = False
         self.gallery_cards: List[Dict] = []
         self.gallery_card_by_key: Dict[str, Dict] = {}
+        self.gallery_column_count: int = GALLERY_MAX_COLUMNS
+        self.gallery_rendered_count: int = 0
         self.gallery_thumbnail_refs: Dict[Tuple[str, str], "ImageTk.PhotoImage"] = {}
         self.card_meta_visible_keys: set[str] = set()
+        self.gallery_batch_after_id: Optional[str] = None
         self.thumbnail_job_queue = deque()
         self.thumbnail_job_set: set[int] = set()
         self.thumbnail_job_after_id: Optional[str] = None
@@ -781,27 +830,442 @@ class BeRealDownloaderApp:
         self.scroller_active = self._is_scroller_tab_active()
         if self.scroller_active:
             if self.scroller_needs_refresh:
-                self.refresh_scroller()
+                if self.scroller_detail_mode:
+                    self.render_scroller_detail()
+                else:
+                    self.refresh_scroller()
             else:
                 self.refresh_gallery_selection_styles()
-                self._schedule_thumbnail_request(1)
+                if not self.scroller_detail_mode:
+                    self._schedule_thumbnail_request(1)
+                    self._schedule_gallery_batch_load()
+                else:
+                    self.render_scroller_detail()
         else:
             self._cancel_thumbnail_loading()
+            self._cancel_gallery_batch_load()
 
     def request_scroller_refresh(self) -> None:
         self.scroller_needs_refresh = True
-        if self.scroller_active:
+        if self.scroller_active and not self.scroller_detail_mode:
             self.refresh_scroller()
+
+    def _show_scroller_grid(self) -> None:
+        self.scroller_detail_mode = False
+        self.scroller_detail_index = None
+        if self.scroller_detail_frame is not None:
+            self.scroller_detail_frame.pack_forget()
+        if self.scroller_grid_frame is not None:
+            self.scroller_grid_frame.pack(fill=tk.BOTH, expand=True)
+        if self.gallery_canvas is not None:
+            self.gallery_canvas.focus_set()
+            self._schedule_thumbnail_request(1)
+            self._schedule_gallery_batch_load()
+        self._update_gallery_initial_loading_visibility()
+
+    def _show_gallery_loading_footer(self, text: str = "Loading more photos...") -> None:
+        if self.gallery_footer is None:
+            return
+        self.gallery_footer_label_var.set(text)
+        if not self.gallery_footer.winfo_manager():
+            self.gallery_footer.pack(fill=tk.X, pady=(4, 0))
+        if self.gallery_footer_progress is not None:
+            self.gallery_footer_progress.start(10)
+
+    def _hide_gallery_loading_footer(self) -> None:
+        if self.gallery_footer_progress is not None:
+            self.gallery_footer_progress.stop()
+        if self.gallery_footer is not None and self.gallery_footer.winfo_manager():
+            self.gallery_footer.pack_forget()
+        self.gallery_footer_label_var.set("")
+
+    def _show_gallery_initial_loading(self) -> None:
+        self.gallery_initial_loading_active = False
+        if self.gallery_loading_overlay_progress is not None:
+            self.gallery_loading_overlay_progress.stop()
+        if self.gallery_loading_overlay is not None:
+            self.gallery_loading_overlay.place_forget()
+
+    def _hide_gallery_initial_loading(self) -> None:
+        self.gallery_initial_loading_active = False
+        if self.gallery_loading_overlay_progress is not None:
+            self.gallery_loading_overlay_progress.stop()
+        if self.gallery_loading_overlay is not None:
+            self.gallery_loading_overlay.place_forget()
+
+    def _visible_gallery_cards(self) -> List[Dict]:
+        if not self.gallery_cards:
+            return []
+        indices = self._visible_card_indices()
+        if indices:
+            return [self.gallery_cards[idx] for idx in indices if 0 <= idx < len(self.gallery_cards)]
+        fallback_count = min(len(self.gallery_cards), max(1, self.gallery_column_count) * 2)
+        return self.gallery_cards[:fallback_count]
+
+    def _update_gallery_initial_loading_visibility(self) -> None:
+        if not self.photos or not self.scroller_active or self.scroller_detail_mode:
+            self._hide_gallery_initial_loading()
+            return
+        if any(bool(card.get("has_thumbnail")) for card in self._visible_gallery_cards()):
+            self._hide_gallery_initial_loading()
+        else:
+            self._show_gallery_initial_loading()
+
+    def _cancel_gallery_batch_load(self) -> None:
+        if self.gallery_batch_after_id is not None:
+            try:
+                self.root.after_cancel(self.gallery_batch_after_id)
+            except Exception:
+                pass
+        self.gallery_batch_after_id = None
+        self._hide_gallery_loading_footer()
+
+    def _ensure_gallery_cards_rendered(self, target_count: int) -> None:
+        if self.gallery_inner is None:
+            return
+        target_count = max(0, min(len(self.photos), target_count))
+        if target_count <= self.gallery_rendered_count:
+            return
+
+        for idx in range(self.gallery_rendered_count, target_count):
+            photo = self.photos[idx]
+            card = self._create_gallery_card(idx, photo)
+            self.gallery_cards.append(card)
+            self.gallery_card_by_key[photo.key] = card
+            self._place_card(card)
+
+        self.gallery_rendered_count = target_count
+        self.update_gallery_scrollregion()
+
+    def _gallery_needs_more_cards(self) -> bool:
+        if (
+            self.gallery_canvas is None
+            or self.gallery_inner is None
+            or self.gallery_rendered_count >= len(self.photos)
+        ):
+            return False
+        content_height = max(1, self.gallery_inner.winfo_height())
+        view_bottom = self.gallery_canvas.canvasy(self.gallery_canvas.winfo_height())
+        threshold = max(500, int(self.gallery_canvas.winfo_height() * GALLERY_PREFETCH_VIEWPORTS))
+        return (content_height - view_bottom) <= threshold
+
+    def _schedule_gallery_batch_load(self, delay_ms: int = 1) -> None:
+        if (
+            not self.scroller_active
+            or self.scroller_detail_mode
+            or self.gallery_rendered_count >= len(self.photos)
+            or not self._gallery_needs_more_cards()
+        ):
+            return
+        if self.gallery_batch_after_id is not None:
+            return
+        self._show_gallery_loading_footer()
+        self.gallery_batch_after_id = self.root.after(delay_ms, self._run_gallery_batch_load)
+
+    def _run_gallery_batch_load(self) -> None:
+        self.gallery_batch_after_id = None
+        if not self.scroller_active or self.scroller_detail_mode:
+            self._hide_gallery_loading_footer()
+            return
+
+        next_count = min(len(self.photos), self.gallery_rendered_count + GALLERY_BATCH_SIZE)
+        self._ensure_gallery_cards_rendered(next_count)
+        self._hide_gallery_loading_footer()
+        self.refresh_gallery_selection_styles()
+        self._update_gallery_initial_loading_visibility()
+        self._schedule_thumbnail_request(1)
+        if self._gallery_needs_more_cards():
+            self._schedule_gallery_batch_load()
+
+    def open_scroller_detail(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self.photos):
+            return
+        self.scroller_detail_mode = True
+        self.scroller_detail_index = idx
+        self._hide_gallery_initial_loading()
+        if self.scroller_grid_frame is not None:
+            self.scroller_grid_frame.pack_forget()
+        if self.scroller_detail_frame is not None:
+            self.scroller_detail_frame.pack(fill=tk.BOTH, expand=True)
+        self.render_scroller_detail()
+
+    def exit_scroller_detail(self) -> None:
+        if self.scroller_needs_refresh:
+            self.refresh_scroller()
+            return
+        self._show_scroller_grid()
+        if self.selection_focus_index is not None:
+            self._ensure_scroller_index_visible(self.selection_focus_index)
+
+    def render_scroller_detail(self) -> None:
+        if (
+            not self.scroller_detail_mode
+            or self.scroller_detail_index is None
+            or self.scroller_detail_index < 0
+            or self.scroller_detail_index >= len(self.photos)
+            or self.scroller_detail_image_label is None
+        ):
+            return
+
+        photo = self.photos[self.scroller_detail_index]
+        old_keys = set(self.selected_photo_keys)
+        self.selected_photo_keys = {photo.key}
+        self.selection_anchor_index = self.scroller_detail_index
+        self.selection_focus_index = self.scroller_detail_index
+        self._refresh_gallery_selection_for_keys(old_keys ^ self.selected_photo_keys)
+        self.sync_table_selection_from_model()
+        self.update_selection_status()
+        mode = self.mode_var.get()
+        holder = self.scroller_detail_image_label
+        canvas_w = max(720, int(holder.winfo_width() or self.root.winfo_width() * 0.88))
+        canvas_h = max(520, int(holder.winfo_height() or self.root.winfo_height() * 0.82))
+        max_w = max(720, int(canvas_w * 0.92))
+        max_h = max(520, int(canvas_h * 0.92))
+        items = self.scroller_detail_canvas_items
+
+        holder.configure(width=canvas_w, height=canvas_h)
+
+        try:
+            img = self._render_preview_image(photo, mode, max_w, max_h)
+            photo_img = ImageTk.PhotoImage(img)
+            image_w = photo_img.width()
+            image_h = photo_img.height()
+            x0 = int((canvas_w - image_w) / 2)
+            y0 = int((canvas_h - image_h) / 2)
+            x1 = x0 + image_w
+            y1 = y0 + image_h
+            self.scroller_detail_image_bounds = (x0, y0, x1, y1)
+            holder.itemconfigure(items["image"], image=photo_img, state="normal")
+            holder.coords(items["image"], canvas_w / 2, canvas_h / 2)
+            holder.itemconfigure(items["placeholder"], state="hidden")
+            holder.itemconfigure(items["text"], text="", state="hidden")
+            holder.image = photo_img
+        except Exception:
+            x0 = int(canvas_w * 0.12)
+            y0 = int(canvas_h * 0.08)
+            x1 = int(canvas_w * 0.88)
+            y1 = int(canvas_h * 0.92)
+            self.scroller_detail_image_bounds = (x0, y0, x1, y1)
+            holder.itemconfigure(items["image"], image="", state="hidden")
+            holder.itemconfigure(items["placeholder"], state="normal")
+            holder.itemconfigure(items["text"], text="Preview unavailable", state="normal")
+            holder.image = None
+
+        holder.coords(items["placeholder"], *self.scroller_detail_image_bounds)
+        holder.coords(items["text"], canvas_w / 2, canvas_h / 2)
+        self._position_scroller_detail_controls()
+        self.update_scroller_detail_metadata_visibility()
+
+        self.scroller_detail_title_var.set(
+            f"{self.scroller_detail_index + 1} of {len(self.photos)}  |  {MODE_LABELS.get(mode, mode)}"
+        )
+        self.scroller_detail_info_var.set(self._format_time(photo.taken_time))
+        holder.focus_set()
+
+    def _position_scroller_detail_controls(self) -> None:
+        if self.scroller_detail_image_label is None or not self.scroller_detail_canvas_items:
+            return
+        canvas = self.scroller_detail_image_label
+        items = self.scroller_detail_canvas_items
+        x0, y0, x1, y1 = self.scroller_detail_image_bounds
+        image_w = max(1, x1 - x0)
+        image_h = max(1, y1 - y0)
+
+        meta_radius = 13
+        meta_cx = x1 - 18
+        meta_cy = y0 + 18
+        canvas.coords(items["meta_button_oval"], meta_cx - meta_radius, meta_cy - meta_radius, meta_cx + meta_radius, meta_cy + meta_radius)
+        canvas.coords(items["meta_button_text"], meta_cx, meta_cy)
+
+        arrow_radius = max(18, min(28, int(min(image_w, image_h) * 0.035)))
+        arrow_margin = max(20, int(image_w * 0.045))
+        arrow_cy = (y0 + y1) / 2
+        left_cx = x0 + arrow_margin
+        right_cx = x1 - arrow_margin
+        canvas.coords(
+            items["left_arrow_oval"],
+            left_cx - arrow_radius,
+            arrow_cy - arrow_radius,
+            left_cx + arrow_radius,
+            arrow_cy + arrow_radius,
+        )
+        canvas.coords(items["left_arrow_text"], left_cx, arrow_cy - 1)
+        canvas.coords(
+            items["right_arrow_oval"],
+            right_cx - arrow_radius,
+            arrow_cy - arrow_radius,
+            right_cx + arrow_radius,
+            arrow_cy + arrow_radius,
+        )
+        canvas.coords(items["right_arrow_text"], right_cx, arrow_cy - 1)
+
+        at_first = self.scroller_detail_index in (None, 0)
+        at_last = self.scroller_detail_index is None or self.scroller_detail_index >= (len(self.photos) - 1)
+        for item in (items["left_arrow_oval"], items["left_arrow_text"]):
+            canvas.itemconfigure(item, state="hidden" if at_first else "normal")
+        for item in (items["right_arrow_oval"], items["right_arrow_text"]):
+            canvas.itemconfigure(item, state="hidden" if at_last else "normal")
+        canvas.itemconfigure(items["meta_button_oval"], fill="#000000", outline="#000000", state="normal")
+        canvas.itemconfigure(items["meta_button_text"], fill="#ffffff", state="normal")
+
+    def _detail_meta_button_hit(self, item_id: int) -> bool:
+        items = self.scroller_detail_canvas_items
+        return item_id in {items.get("meta_button_oval"), items.get("meta_button_text")}
+
+    def _detail_arrow_hit(self, item_id: int) -> bool:
+        items = self.scroller_detail_canvas_items
+        return item_id in {
+            items.get("left_arrow_oval"),
+            items.get("left_arrow_text"),
+            items.get("right_arrow_oval"),
+            items.get("right_arrow_text"),
+        }
+
+    def on_scroller_detail_press(self, event: tk.Event) -> None:
+        self.scroller_detail_drag_start = (event.x, event.y)
+
+    def on_scroller_detail_release(self, event: tk.Event) -> str:
+        if self.scroller_detail_image_label is None:
+            return "break"
+        current_items = self.scroller_detail_image_label.find_withtag("current")
+        if current_items:
+            current_item = current_items[0]
+            if self._detail_meta_button_hit(current_item) or self._detail_arrow_hit(current_item):
+                self.scroller_detail_drag_start = None
+                return "break"
+
+        start = self.scroller_detail_drag_start
+        self.scroller_detail_drag_start = None
+        if start is None:
+            return "break"
+
+        dx = event.x - start[0]
+        if abs(dx) >= 70:
+            if dx < 0:
+                self.show_next_scroller_detail()
+            else:
+                self.show_previous_scroller_detail()
+            return "break"
+
+        canvas_w = max(1, int(self.scroller_detail_image_label.winfo_width() or self.scroller_detail_image_label.cget("width")))
+        left_zone = canvas_w * 0.28
+        right_zone = canvas_w * 0.72
+        if event.x <= left_zone:
+            self.show_previous_scroller_detail()
+        elif event.x >= right_zone:
+            self.show_next_scroller_detail()
+        return "break"
+
+    def on_scroller_detail_prev_click(self) -> str:
+        self.show_previous_scroller_detail()
+        return "break"
+
+    def on_scroller_detail_next_click(self) -> str:
+        self.show_next_scroller_detail()
+        return "break"
+
+    def on_scroller_detail_meta_button(self) -> str:
+        if self.scroller_detail_index is None:
+            return "break"
+        self.show_card_metadata(self.photos[self.scroller_detail_index].key)
+        return "break"
+
+    def _render_scroller_detail_metadata(self) -> None:
+        self.scroller_detail_meta_after_id = None
+        if (
+            self.scroller_detail_index is None
+            or self.scroller_detail_meta_label is None
+            or not self.scroller_detail_meta_visible
+        ):
+            return
+        photo = self.photos[self.scroller_detail_index]
+        if not (self.show_all_metadata_var.get() or photo.key in self.card_meta_visible_keys):
+            return
+        self.scroller_detail_meta_label.configure(text=self._format_card_metadata(photo))
+
+    def update_scroller_detail_metadata_visibility(self) -> None:
+        if (
+            self.scroller_detail_image_label is None
+            or self.scroller_detail_meta_overlay is None
+            or self.scroller_detail_meta_label is None
+            or self.scroller_detail_index is None
+        ):
+            return
+
+        canvas = self.scroller_detail_image_label
+        items = self.scroller_detail_canvas_items
+        photo = self.photos[self.scroller_detail_index]
+        show = self.show_all_metadata_var.get() or (photo.key in self.card_meta_visible_keys)
+        x0, y0, x1, y1 = self.scroller_detail_image_bounds
+        overlay_w = max(260, int((x1 - x0) * 0.72))
+        overlay_h = max(180, int((y1 - y0) * 0.6))
+        font_size = max(12, min(15, int((x1 - x0) / 42)))
+        wraplength = max(240, overlay_w - 36)
+        self.scroller_detail_meta_label.configure(font=("Helvetica", font_size, "bold"), wraplength=wraplength)
+
+        if self.scroller_detail_meta_after_id is not None:
+            try:
+                self.root.after_cancel(self.scroller_detail_meta_after_id)
+            except Exception:
+                pass
+            self.scroller_detail_meta_after_id = None
+
+        if show:
+            self.scroller_detail_meta_overlay.place(
+                x=int((x0 + x1 - overlay_w) / 2),
+                y=int((y0 + y1 - overlay_h) / 2),
+                width=overlay_w,
+                height=overlay_h,
+            )
+            self.scroller_detail_meta_visible = True
+            self.scroller_detail_meta_label.configure(text="Loading metadata...")
+            self.scroller_detail_meta_after_id = self.root.after(16, self._render_scroller_detail_metadata)
+            canvas.itemconfigure(items["meta_button_text"], text="×")
+        else:
+            self.scroller_detail_meta_overlay.place_forget()
+            self.scroller_detail_meta_visible = False
+            self.scroller_detail_meta_label.configure(text="")
+            canvas.itemconfigure(items["meta_button_text"], text="i")
+
+    def show_previous_scroller_detail(self) -> None:
+        if self.scroller_detail_index is None:
+            return
+        self.scroller_detail_index = max(0, self.scroller_detail_index - 1)
+        self.render_scroller_detail()
+
+    def show_next_scroller_detail(self) -> None:
+        if self.scroller_detail_index is None:
+            return
+        self.scroller_detail_index = min(len(self.photos) - 1, self.scroller_detail_index + 1)
+        self.render_scroller_detail()
+
+    def on_scroller_detail_left(self, _event: tk.Event) -> str:
+        self.show_previous_scroller_detail()
+        return "break"
+
+    def on_scroller_detail_right(self, _event: tk.Event) -> str:
+        self.show_next_scroller_detail()
+        return "break"
+
+    def on_scroller_detail_escape(self, _event: tk.Event) -> str:
+        self.exit_scroller_detail()
+        return "break"
+
+    def on_scroller_detail_configure(self, _event: tk.Event) -> None:
+        if self.scroller_detail_mode:
+            self.root.after_idle(self.render_scroller_detail)
 
     def _clear_scroller_widgets(self) -> None:
         if self.gallery_inner is None:
             return
         self._cancel_thumbnail_loading()
+        self._cancel_gallery_batch_load()
         for card in self.gallery_cards:
             self._cancel_card_metadata_job(card)
         self.gallery_thumbnail_refs.clear()
         self.gallery_cards.clear()
         self.gallery_card_by_key.clear()
+        self.gallery_rendered_count = 0
         for child in self.gallery_inner.winfo_children():
             child.destroy()
         self.update_gallery_scrollregion()
@@ -812,31 +1276,10 @@ class BeRealDownloaderApp:
 
         ttk.Label(
             top,
-            text="Image preview scroller (1 per row). Click to select, Shift+Click for range. Use the i button for metadata.",
+            text="All photos. Click any photo to open it. Use Left/Right to move, and Esc or Back To Grid to return.",
         ).pack(side=tk.LEFT)
         right_controls = ttk.Frame(top)
         right_controls.pack(side=tk.RIGHT)
-        min_percent, max_percent = self._zoom_percent_bounds()
-        zoom_scale = ttk.Scale(
-            right_controls,
-            from_=float(min_percent),
-            to=float(max_percent),
-            orient=tk.HORIZONTAL,
-            length=180,
-            variable=self.zoom_scale_var,
-            command=self.on_zoom_slider_changed,
-        )
-        zoom_scale.pack(side=tk.LEFT, padx=(0, 8))
-        zoom_entry = ttk.Entry(
-            right_controls,
-            textvariable=self.zoom_percent_var,
-            width=5,
-            justify="right",
-        )
-        zoom_entry.pack(side=tk.LEFT)
-        zoom_entry.bind("<Return>", self.on_zoom_percent_commit)
-        zoom_entry.bind("<FocusOut>", self.on_zoom_percent_commit)
-        ttk.Label(right_controls, text="%").pack(side=tk.LEFT, padx=(4, 10))
         ttk.Checkbutton(
             right_controls,
             text="Show metadata on all cards",
@@ -847,24 +1290,43 @@ class BeRealDownloaderApp:
         self.scroller_container = ttk.Frame(parent, padding=(6, 2, 6, 4))
         self.scroller_container.pack(fill=tk.BOTH, expand=True)
 
+        self.scroller_grid_frame = ttk.Frame(self.scroller_container)
+        self.scroller_grid_frame.pack(fill=tk.BOTH, expand=True)
+
         self.gallery_canvas = tk.Canvas(
-            self.scroller_container,
+            self.scroller_grid_frame,
             highlightthickness=0,
             bd=0,
             bg=self._theme_background(),
         )
         self.gallery_scrollbar = ttk.Scrollbar(
-            self.scroller_container, orient=tk.VERTICAL, command=self.gallery_canvas.yview
+            self.scroller_grid_frame, orient=tk.VERTICAL, command=self.gallery_canvas.yview
         )
         self.gallery_canvas.configure(yscrollcommand=self.gallery_scrollbar.set)
 
         self.gallery_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.gallery_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
+        footer = ttk.Frame(self.scroller_grid_frame)
+        footer_label = ttk.Label(footer, textvariable=self.gallery_footer_label_var, anchor="center")
+        footer_label.pack(side=tk.LEFT, padx=(0, 10))
+        footer_progress = ttk.Progressbar(footer, mode="indeterminate", length=140)
+        footer_progress.pack(side=tk.LEFT)
+        self.gallery_footer = footer
+        self.gallery_footer_progress = footer_progress
+
+        loading_overlay = ttk.Frame(self.scroller_grid_frame, padding=(18, 14, 18, 14))
+        loading_label = ttk.Label(loading_overlay, text="Loading previews...", anchor="center")
+        loading_label.pack()
+        loading_progress = ttk.Progressbar(loading_overlay, mode="indeterminate", length=180)
+        loading_progress.pack(pady=(10, 0))
+        self.gallery_loading_overlay = loading_overlay
+        self.gallery_loading_overlay_progress = loading_progress
+
         self.gallery_inner = tk.Frame(self.gallery_canvas, bg=self._theme_background(), bd=0, highlightthickness=0)
         self.gallery_window_id = self.gallery_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
         for c in range(GALLERY_MAX_COLUMNS):
-            self.gallery_inner.columnconfigure(c, weight=1)
+            self.gallery_inner.columnconfigure(c, weight=1 if c < self.gallery_column_count else 0)
 
         self.gallery_inner.bind("<Configure>", self.on_gallery_inner_configure)
         self.gallery_canvas.bind("<Configure>", self.on_gallery_canvas_configure)
@@ -877,6 +1339,108 @@ class BeRealDownloaderApp:
         self.gallery_canvas.bind("<Command-a>", self.on_select_all_shortcut)
         self.gallery_canvas.bind("<Control-a>", self.on_select_all_shortcut)
 
+        detail = ttk.Frame(self.scroller_container)
+        nav = ttk.Frame(detail, padding=(4, 4, 4, 8))
+        nav.pack(fill=tk.X)
+        ttk.Button(nav, text="All Photos", command=self.exit_scroller_detail).pack(side=tk.LEFT)
+        ttk.Label(nav, textvariable=self.scroller_detail_title_var, anchor="center").pack(side=tk.LEFT, expand=True)
+
+        image_holder = tk.Frame(detail, bg="#111111", bd=0, highlightthickness=0)
+        image_holder.pack(fill=tk.BOTH, expand=True)
+        detail_image = tk.Canvas(image_holder, bg="#111111", bd=0, highlightthickness=0)
+        detail_image.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        detail_image.bind("<Configure>", self.on_scroller_detail_configure)
+        detail_image.bind("<Left>", self.on_scroller_detail_left)
+        detail_image.bind("<Right>", self.on_scroller_detail_right)
+        detail_image.bind("<Escape>", self.on_scroller_detail_escape)
+        detail_image.bind("<ButtonPress-1>", self.on_scroller_detail_press)
+        detail_image.bind("<ButtonRelease-1>", self.on_scroller_detail_release)
+
+        detail_canvas_items = {
+            "image": detail_image.create_image(0, 0, anchor="center"),
+            "placeholder": detail_image.create_rectangle(0, 0, 0, 0, fill="#1d1d1d", outline="#333333", width=1),
+            "text": detail_image.create_text(
+                0,
+                0,
+                text="Loading preview...",
+                fill="#ffffff",
+                font=("Helvetica", 16, "bold"),
+                justify="center",
+            ),
+            "meta_button_oval": detail_image.create_oval(0, 0, 0, 0, fill="#000000", outline="#000000", width=1),
+            "meta_button_text": detail_image.create_text(0, 0, text="i", fill="#ffffff", font=("Helvetica", 12, "bold")),
+            "left_arrow_oval": detail_image.create_oval(0, 0, 0, 0, fill="#000000", outline="#000000", width=1),
+            "left_arrow_text": detail_image.create_text(0, 0, text="‹", fill="#ffffff", font=("Helvetica", 26, "bold")),
+            "right_arrow_oval": detail_image.create_oval(0, 0, 0, 0, fill="#000000", outline="#000000", width=1),
+            "right_arrow_text": detail_image.create_text(0, 0, text="›", fill="#ffffff", font=("Helvetica", 26, "bold")),
+        }
+        detail_image.tag_bind(
+            detail_canvas_items["meta_button_oval"],
+            "<Button-1>",
+            lambda _e: self.on_scroller_detail_meta_button(),
+        )
+        detail_image.tag_bind(
+            detail_canvas_items["meta_button_text"],
+            "<Button-1>",
+            lambda _e: self.on_scroller_detail_meta_button(),
+        )
+        detail_image.tag_bind(
+            detail_canvas_items["left_arrow_oval"],
+            "<Button-1>",
+            lambda _e: self.on_scroller_detail_prev_click(),
+        )
+        detail_image.tag_bind(
+            detail_canvas_items["left_arrow_text"],
+            "<Button-1>",
+            lambda _e: self.on_scroller_detail_prev_click(),
+        )
+        detail_image.tag_bind(
+            detail_canvas_items["right_arrow_oval"],
+            "<Button-1>",
+            lambda _e: self.on_scroller_detail_next_click(),
+        )
+        detail_image.tag_bind(
+            detail_canvas_items["right_arrow_text"],
+            "<Button-1>",
+            lambda _e: self.on_scroller_detail_next_click(),
+        )
+
+        detail_meta_overlay = tk.Frame(detail_image, bg=META_UI_BG, bd=0, highlightthickness=0)
+        detail_meta_label = tk.Label(
+            detail_meta_overlay,
+            anchor="center",
+            justify="center",
+            bg=META_UI_BG,
+            fg=META_UI_FG,
+            font=("Helvetica", 14, "bold"),
+        )
+        detail_meta_label.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
+        for widget in (detail_meta_overlay, detail_meta_label):
+            widget.bind("<Left>", self.on_scroller_detail_left)
+            widget.bind("<Right>", self.on_scroller_detail_right)
+            widget.bind("<Escape>", self.on_scroller_detail_escape)
+
+        detail_info = tk.Label(
+            detail,
+            textvariable=self.scroller_detail_info_var,
+            bg="#111111",
+            fg="#ffffff",
+            font=("Helvetica", 11, "bold"),
+        )
+        detail_info.pack(fill=tk.X, pady=(0, 8))
+        detail_info.bind("<Left>", self.on_scroller_detail_left)
+        detail_info.bind("<Right>", self.on_scroller_detail_right)
+        detail_info.bind("<Escape>", self.on_scroller_detail_escape)
+
+        detail.bind("<Left>", self.on_scroller_detail_left)
+        detail.bind("<Right>", self.on_scroller_detail_right)
+        detail.bind("<Escape>", self.on_scroller_detail_escape)
+        self.scroller_detail_frame = detail
+        self.scroller_detail_image_label = detail_image
+        self.scroller_detail_canvas_items = detail_canvas_items
+        self.scroller_detail_meta_overlay = detail_meta_overlay
+        self.scroller_detail_meta_label = detail_meta_label
+
     def _theme_background(self) -> str:
         style = ttk.Style()
         for style_name in ("TFrame", "TNotebook", "TLabel"):
@@ -885,24 +1449,12 @@ class BeRealDownloaderApp:
                 return bg
         return CARD_BG_DEFAULT
 
-    def _zoom_percent_bounds(self) -> Tuple[int, int]:
-        return (1, 400)
-
-    def _display_zoom_percent(self) -> int:
-        return int(round((self.preview_zoom / PREVIEW_ZOOM_DEFAULT) * 100))
-
-    def _zoom_for_percent(self, percent: float) -> float:
-        return PREVIEW_ZOOM_DEFAULT * (percent / 100.0)
-
     def _configure_focus_management(self) -> None:
         self.root.bind_all("<Escape>", self.on_escape_unfocus, add="+")
         self.root.bind_all("<Button-1>", self.on_global_pointer_unfocus, add="+")
 
     def _configure_keyboard_shortcuts(self) -> None:
         bindings = [
-            ("<Command-KeyPress-equal>", self.on_shortcut_zoom_in),
-            ("<Command-KeyPress-plus>", self.on_shortcut_zoom_in),
-            ("<Command-KeyPress-minus>", self.on_shortcut_zoom_out),
             ("<Command-KeyPress-l>", self.on_shortcut_load_data),
             ("<Command-KeyPress-o>", self.on_shortcut_browse),
             ("<Command-KeyPress-L>", self.on_shortcut_load_data),
@@ -932,6 +1484,9 @@ class BeRealDownloaderApp:
         if self.preview_window is not None and self.preview_window.winfo_exists():
             self.preview_window.focus_set()
             return
+        if self.scroller_active and self.scroller_detail_mode and self.scroller_detail_image_label is not None:
+            self.scroller_detail_image_label.focus_set()
+            return
         if self.scroller_active and self.gallery_canvas is not None:
             self.gallery_canvas.focus_set()
             return
@@ -953,28 +1508,12 @@ class BeRealDownloaderApp:
     def _is_scroller_shortcut_available(self) -> bool:
         return self._is_scroller_tab_active()
 
-    def _adjust_zoom_percent(self, delta: int) -> None:
-        if not self._is_scroller_shortcut_available():
-            return
-        min_percent, max_percent = self._zoom_percent_bounds()
-        current = self._display_zoom_percent()
-        target = max(min_percent, min(max_percent, current + delta))
-        self._set_preview_zoom(self._zoom_for_percent(target))
-
     def _select_notebook_tab(self, target_tab: Optional[ttk.Frame]) -> None:
         if self.notebook is None or target_tab is None:
             return
         self.notebook.select(target_tab)
         self.on_notebook_tab_changed(None)
         self._focus_primary_surface()
-
-    def on_shortcut_zoom_in(self, _event: tk.Event) -> str:
-        self._adjust_zoom_percent(10)
-        return "break"
-
-    def on_shortcut_zoom_out(self, _event: tk.Event) -> str:
-        self._adjust_zoom_percent(-10)
-        return "break"
 
     def on_shortcut_load_data(self, _event: tk.Event) -> str:
         self.on_load_data()
@@ -1042,66 +1581,36 @@ class BeRealDownloaderApp:
 
     def on_export_mode_changed(self) -> None:
         self.refresh_table()
-        self.request_scroller_refresh()
-
-    def _set_preview_zoom(self, new_zoom: float) -> None:
-        clamped = max(PREVIEW_ZOOM_MIN, min(PREVIEW_ZOOM_MAX, new_zoom))
-        clamped = round(clamped, 2)
-        if abs(clamped - self.preview_zoom) < 0.005:
-            return
-        self.preview_zoom = clamped
-        zoom_percent = self._display_zoom_percent()
-        self.zoom_label_var.set(f"{zoom_percent}%")
-        self.zoom_percent_var.set(str(zoom_percent))
-        self.zoom_scale_var.set(float(zoom_percent))
         self.last_target_preview_width = 0
-        self._invalidate_preview_cache_for_resize()
-        for card in self.gallery_cards:
-            self.update_card_metadata_visibility(card)
-        self._schedule_thumbnail_request(1)
-
-    def on_zoom_slider_changed(self, value: str) -> None:
-        try:
-            percent = float(value)
-        except (TypeError, ValueError):
+        self.gallery_thumbnail_refs.clear()
+        if self.scroller_active and self.scroller_detail_mode:
+            self.scroller_needs_refresh = True
+            self.render_scroller_detail()
             return
-        self._set_preview_zoom(self._zoom_for_percent(percent))
-
-    def on_zoom_percent_commit(self, _event: Optional[tk.Event] = None) -> None:
-        min_percent, max_percent = self._zoom_percent_bounds()
-        try:
-            percent = int(float(self.zoom_percent_var.get().strip()))
-        except (tk.TclError, ValueError, AttributeError):
-            percent = self._display_zoom_percent()
-        percent = max(min_percent, min(max_percent, percent))
-        self._set_preview_zoom(self._zoom_for_percent(percent))
-        percent = self._display_zoom_percent()
-        self.zoom_label_var.set(f"{percent}%")
-        self.zoom_percent_var.set(str(percent))
-        self.zoom_scale_var.set(float(percent))
+        self.request_scroller_refresh()
 
     def refresh_scroller(self) -> None:
         if self.gallery_inner is None:
             return
 
+        self._show_scroller_grid()
         self._clear_scroller_widgets()
-
-        for idx, photo in enumerate(self.photos):
-            card = self._create_gallery_card(idx, photo)
-            self.gallery_cards.append(card)
-            self.gallery_card_by_key[photo.key] = card
-            self._place_card(card)
+        self._ensure_gallery_cards_rendered(min(len(self.photos), GALLERY_INITIAL_BATCH))
+        self._apply_gallery_column_layout(force=True)
+        self._update_gallery_initial_loading_visibility()
 
         self.last_target_preview_width = self._current_target_preview_width()
         self.update_gallery_scrollregion()
         if self.scroller_active:
             self._schedule_thumbnail_request(1)
+            self._schedule_gallery_batch_load()
         self.refresh_gallery_selection_styles()
         self.update_selection_status()
         self.scroller_needs_refresh = False
 
     def _create_gallery_card(self, idx: int, photo: MemoryPhoto) -> Dict:
         assert self.gallery_inner is not None
+        initial_width, initial_height = self._thumbnail_canvas_size()
 
         frame = tk.Frame(
             self.gallery_inner,
@@ -1110,7 +1619,6 @@ class BeRealDownloaderApp:
             highlightthickness=0,
             padx=0,
             pady=0,
-            cursor="hand2",
             bg=self._theme_background(),
         )
 
@@ -1119,9 +1627,8 @@ class BeRealDownloaderApp:
             bd=0,
             highlightthickness=0,
             bg=self._theme_background(),
-            cursor="hand2",
-            width=360,
-            height=520,
+            width=initial_width,
+            height=initial_height,
         )
         image_canvas.pack(anchor="center")
         canvas_image_item = image_canvas.create_image(0, 0, anchor="nw")
@@ -1201,6 +1708,7 @@ class BeRealDownloaderApp:
             "meta_label": meta_label,
             "meta_visible": False,
             "meta_after_id": None,
+            "has_thumbnail": False,
         }
 
         for widget in (frame, image_canvas, meta_overlay, meta_label):
@@ -1235,18 +1743,19 @@ class BeRealDownloaderApp:
         text: str = "",
     ) -> None:
         canvas = card["image_canvas"]
+        width, height = self._thumbnail_canvas_size()
+        image_x = 0
+        image_y = 0
         if image_obj is not None:
-            width = image_obj.width()
-            height = image_obj.height()
-        else:
-            width = max(320, self._current_target_preview_width())
-            height = max(420, int(width * 1.4))
+            image_x = int((width - image_obj.width()) / 2)
+            image_y = int((height - image_obj.height()) / 2)
 
         canvas.configure(width=width, height=height)
-        canvas.coords(card["canvas_image_item"], 0, 0)
+        canvas.coords(card["canvas_image_item"], image_x, image_y)
         canvas.coords(card["placeholder_rect"], 0, 0, width, height)
-        canvas.coords(card["selection_overlay"], 0, 0, width, height)
+        canvas.coords(card["selection_overlay"], 1, 1, max(1, width - 1), max(1, height - 1))
         canvas.coords(card["canvas_text_item"], width / 2, height / 2)
+        canvas.itemconfigure(card["canvas_text_item"], width=max(72, width - 16))
 
         if image_obj is not None:
             canvas.itemconfigure(card["canvas_image_item"], image=image_obj, state="normal")
@@ -1258,6 +1767,7 @@ class BeRealDownloaderApp:
             canvas.itemconfigure(card["canvas_text_item"], text=text, fill=PREVIEW_TEXT_FG, state="normal")
 
         canvas.image = image_obj
+        card["has_thumbnail"] = image_obj is not None
         canvas.tag_raise(card["placeholder_rect"])
         canvas.tag_raise(card["canvas_image_item"])
         canvas.tag_raise(card["selection_overlay"])
@@ -1268,7 +1778,10 @@ class BeRealDownloaderApp:
 
     def _position_meta_button(self, card: Dict) -> None:
         canvas = card["image_canvas"]
-        width = max(1, int(canvas.winfo_width() or canvas.cget("width")))
+        width = int(canvas.winfo_width())
+        if width <= 1:
+            width = int(canvas.cget("width"))
+        width = max(1, width)
         cx = width - 18
         cy = 18
         radius = 11
@@ -1290,7 +1803,45 @@ class BeRealDownloaderApp:
         show = self.show_all_metadata_var.get() or (photo.key in self.card_meta_visible_keys)
         if not show or not card["meta_visible"]:
             return
-        card["meta_label"].configure(text=self._format_card_metadata(photo))
+        layout = self._grid_metadata_layout(card)
+        card["meta_label"].configure(text=self._format_thumbnail_metadata(photo, layout))
+
+    def _format_thumbnail_metadata(self, photo: MemoryPhoto, layout: Optional[Dict[str, float]] = None) -> str:
+        lines = [self._format_time_thumbnail(photo.taken_time)]
+        if photo.caption:
+            caption = photo.caption.strip()
+            if layout is not None:
+                font_size = max(8.0, float(layout["font_size"]))
+                approx_chars_per_line = max(12, int(float(layout["wraplength"]) / max(6.0, font_size * 0.62)))
+                max_chars = max(18, min(56, int(approx_chars_per_line)))
+                caption = self._wrap_thumbnail_caption(caption, max_chars, max_lines=2)
+            elif len(caption) > 84:
+                caption = caption[:81].rstrip() + "..."
+            lines.append(caption)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _wrap_thumbnail_caption(caption: str, max_chars_per_line: int, max_lines: int = 2) -> str:
+        normalized = " ".join(caption.split())
+        if not normalized:
+            return ""
+
+        wrapped = textwrap.wrap(
+            normalized,
+            width=max_chars_per_line,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        if not wrapped:
+            return textwrap.shorten(normalized, width=max_chars_per_line, placeholder="...")
+        if len(wrapped) <= max_lines:
+            return "\n".join(wrapped)
+
+        visible = wrapped[: max_lines - 1]
+        tail_source = " ".join(wrapped[max_lines - 1 :])
+        tail_line = textwrap.shorten(tail_source, width=max_chars_per_line, placeholder="...")
+        visible.append(tail_line)
+        return "\n".join(visible)
 
     def _format_card_metadata(self, photo: MemoryPhoto) -> str:
         mode = self.mode_var.get()
@@ -1321,30 +1872,69 @@ class BeRealDownloaderApp:
         if self.gallery_inner is None:
             return
         idx = card["index"]
-        row = idx // GALLERY_MAX_COLUMNS
-        col = idx % GALLERY_MAX_COLUMNS
-        card["frame"].grid(row=row, column=col, sticky="ew", padx=0, pady=8)
+        columns = max(1, self.gallery_column_count)
+        row = idx // columns
+        col = idx % columns
+        card["frame"].grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
 
     def on_toggle_all_metadata(self) -> None:
+        self.card_meta_visible_keys.clear()
+        if self.scroller_detail_mode:
+            self.update_scroller_detail_metadata_visibility()
+            self.root.after_idle(self._refresh_all_gallery_metadata_visibility)
+        else:
+            self._refresh_all_gallery_metadata_visibility()
+            self.update_scroller_detail_metadata_visibility()
+        self.update_gallery_scrollregion()
+
+    def _refresh_all_gallery_metadata_visibility(self) -> None:
         for card in self.gallery_cards:
             self.update_card_metadata_visibility(card)
-        self.update_gallery_scrollregion()
+
+    def _grid_metadata_layout(self, card: Dict) -> Dict[str, float]:
+        canvas = card["image_canvas"]
+        width = max(1, int(canvas.winfo_width() or canvas.cget("width")))
+        font_size = max(8, min(11, int(width / 17)))
+        wraplength = max(92, width - 18)
+        relwidth = 0.9 if width < 120 else 0.86
+        relheight = 0.68 if width < 120 else 0.62
+        rely = 0.66 if width < 120 else 0.64
+        return {
+            "font_size": font_size,
+            "wraplength": wraplength,
+            "relwidth": relwidth,
+            "relheight": relheight,
+            "rely": rely,
+            "padding": max(4, min(8, int(width / 22))),
+        }
 
     def update_card_metadata_visibility(self, card: Dict) -> None:
         photo: MemoryPhoto = card["photo"]
         show = self.show_all_metadata_var.get() or (photo.key in self.card_meta_visible_keys)
-        card["meta_label"].configure(wraplength=max(260, self._current_target_preview_width() - 80))
+        layout = self._grid_metadata_layout(card)
+        card["meta_label"].configure(
+            wraplength=int(layout["wraplength"]),
+            font=("Helvetica", int(layout["font_size"]), "bold"),
+            padx=int(layout["padding"]),
+            pady=int(layout["padding"]),
+        )
 
         if show:
             if not card["meta_visible"]:
                 card["meta_overlay"].place(
                     relx=0.5,
-                    rely=0.5,
+                    rely=layout["rely"],
                     anchor="center",
-                    relwidth=0.92,
-                    relheight=0.82,
+                    relwidth=layout["relwidth"],
+                    relheight=layout["relheight"],
                 )
                 card["meta_visible"] = True
+            else:
+                card["meta_overlay"].place_configure(
+                    rely=layout["rely"],
+                    relwidth=layout["relwidth"],
+                    relheight=layout["relheight"],
+                )
             self._set_meta_button_symbol(card, "×")
             self._cancel_card_metadata_job(card)
             card["meta_label"].configure(text="Loading metadata...")
@@ -1365,6 +1955,13 @@ class BeRealDownloaderApp:
         card = self.gallery_card_by_key.get(photo_key)
         if card is not None:
             self.update_card_metadata_visibility(card)
+        if (
+            self.scroller_detail_mode
+            and self.scroller_detail_index is not None
+            and 0 <= self.scroller_detail_index < len(self.photos)
+            and self.photos[self.scroller_detail_index].key == photo_key
+        ):
+            self.update_scroller_detail_metadata_visibility()
         self.update_gallery_scrollregion()
 
     def update_gallery_scrollregion(self) -> None:
@@ -1372,16 +1969,50 @@ class BeRealDownloaderApp:
             return
         self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
 
+    def _gallery_column_target(self) -> int:
+        if self.gallery_canvas is None:
+            return self.gallery_column_count
+        canvas_w = int(self.gallery_canvas.winfo_width() or 0)
+        if canvas_w <= 1:
+            return self.gallery_column_count
+        if canvas_w >= GALLERY_SIX_COLUMN_BREAKPOINT:
+            return GALLERY_MAX_COLUMNS
+        if canvas_w >= GALLERY_FIVE_COLUMN_BREAKPOINT:
+            return GALLERY_MEDIUM_COLUMNS
+        return GALLERY_MIN_COLUMNS
+
+    def _apply_gallery_column_layout(self, force: bool = False) -> None:
+        if self.gallery_inner is None:
+            return
+        new_count = self._gallery_column_target()
+        if not force and new_count == self.gallery_column_count:
+            return
+        self.gallery_column_count = new_count
+        for c in range(GALLERY_MAX_COLUMNS):
+            self.gallery_inner.columnconfigure(c, weight=1 if c < self.gallery_column_count else 0)
+        for card in self.gallery_cards:
+            self._place_card(card)
+        self.update_gallery_scrollregion()
+
     def _current_target_preview_width(self) -> int:
         if self.gallery_canvas is None:
-            return int(760 * self.preview_zoom)
+            return 128
         canvas_w = self.gallery_canvas.winfo_width()
         if canvas_w <= 1:
-            return int(760 * self.preview_zoom)
-        # One card per row, intentionally smaller than full width.
-        base_w = min(980, max(560, canvas_w - 220))
-        zoomed = int(base_w * self.preview_zoom)
-        return min(1700, max(40, zoomed))
+            return 128
+        columns = max(1, self.gallery_column_count)
+        gutter = 12 + ((columns - 1) * 12)
+        thumb_w = int((canvas_w - gutter) / columns)
+        return max(GRID_THUMB_MIN_WIDTH, min(GRID_THUMB_MAX_WIDTH, thumb_w))
+
+    def _thumbnail_canvas_height(self, width: Optional[int] = None) -> int:
+        if width is None:
+            width = self._current_target_preview_width()
+        return max(132, int(width * GRID_THUMB_HEIGHT_RATIO))
+
+    def _thumbnail_canvas_size(self) -> Tuple[int, int]:
+        width = self._current_target_preview_width()
+        return width, self._thumbnail_canvas_height(width)
 
     def _handle_preview_width_change(self) -> None:
         new_width = self._current_target_preview_width()
@@ -1401,16 +2032,21 @@ class BeRealDownloaderApp:
         self.gallery_thumbnail_refs.clear()
         for card in self.gallery_cards:
             self._set_card_canvas_image(card, None, "Loading preview...")
+        self._update_gallery_initial_loading_visibility()
 
     def on_gallery_inner_configure(self, _event: tk.Event) -> None:
         self.update_gallery_scrollregion()
+        self._update_gallery_initial_loading_visibility()
 
     def on_gallery_canvas_configure(self, event: tk.Event) -> None:
         if self.gallery_window_id is not None and self.gallery_canvas is not None:
             self.gallery_canvas.itemconfigure(self.gallery_window_id, width=event.width)
+        self._apply_gallery_column_layout()
         self.update_gallery_scrollregion()
         self._handle_preview_width_change()
         self._schedule_thumbnail_request()
+        self._schedule_gallery_batch_load()
+        self._update_gallery_initial_loading_visibility()
 
     def on_gallery_mouse_wheel(self, event: tk.Event) -> None:
         if self.gallery_canvas is None:
@@ -1434,7 +2070,9 @@ class BeRealDownloaderApp:
 
         if step != 0:
             self.gallery_canvas.yview_scroll(step, "units")
-            self._schedule_thumbnail_request(120)
+            self._schedule_thumbnail_request(60)
+            self._schedule_gallery_batch_load()
+            self._update_gallery_initial_loading_visibility()
 
     def on_gallery_item_click(self, idx: int, event: tk.Event, action: str = "single") -> None:
         if idx < 0 or idx >= len(self.photos):
@@ -1479,6 +2117,8 @@ class BeRealDownloaderApp:
         self._refresh_gallery_selection_for_keys(old_keys ^ self.selected_photo_keys)
         self.sync_table_selection_from_model()
         self.update_selection_status()
+        if action == "single" and not shift_down:
+            self.open_scroller_detail(idx)
 
     def _move_selection_by_arrow(self, direction: int, extend: bool) -> Optional[int]:
         if not self.photos:
@@ -1579,7 +2219,10 @@ class BeRealDownloaderApp:
         return "break"
 
     def _ensure_scroller_index_visible(self, idx: int) -> None:
-        if self.gallery_canvas is None or idx < 0 or idx >= len(self.gallery_cards):
+        if self.gallery_canvas is None or idx < 0 or idx >= len(self.photos):
+            return
+        self._ensure_gallery_cards_rendered(idx + 1)
+        if idx >= len(self.gallery_cards):
             return
         frame = self.gallery_cards[idx]["frame"]
         self.root.update_idletasks()
@@ -1596,6 +2239,7 @@ class BeRealDownloaderApp:
             self.gallery_canvas.yview_moveto(target)
 
         self._schedule_thumbnail_request(1)
+        self._update_gallery_initial_loading_visibility()
 
     def on_table_arrow_key(self, event: tk.Event) -> str:
         direction = -1 if event.keysym.endswith("Up") else 1
@@ -1670,7 +2314,11 @@ class BeRealDownloaderApp:
         self.request_visible_thumbnail_loading()
 
     def request_visible_thumbnail_loading(self) -> None:
+        if self.scroller_detail_mode:
+            self._hide_gallery_initial_loading()
+            return
         if not self.scroller_active or not self.gallery_cards or self.gallery_canvas is None:
+            self._hide_gallery_initial_loading()
             return
 
         mode = self.mode_var.get()
@@ -1694,25 +2342,29 @@ class BeRealDownloaderApp:
 
         if self.thumbnail_job_after_id is None and self.thumbnail_job_queue:
             self.thumbnail_job_after_id = self.root.after(1, self._process_thumbnail_batch)
+        self._update_gallery_initial_loading_visibility()
+        self._schedule_gallery_batch_load()
 
     def _visible_card_indices(self) -> List[int]:
         if self.gallery_canvas is None:
             return []
         y0, y1 = self.gallery_canvas.yview()
         total = max(1, len(self.gallery_cards))
-        rows = (total + GALLERY_MAX_COLUMNS - 1) // GALLERY_MAX_COLUMNS
+        columns = max(1, self.gallery_column_count)
+        rows = (total + columns - 1) // columns
         first_row = max(0, int(y0 * rows) - 2)
         last_row = min(rows - 1, int(y1 * rows) + 2)
         indices: List[int] = []
         for row in range(first_row, last_row + 1):
-            start = row * GALLERY_MAX_COLUMNS
-            end = min(total, start + GALLERY_MAX_COLUMNS)
+            start = row * columns
+            end = min(total, start + columns)
             indices.extend(range(start, end))
         return indices
 
     def _process_thumbnail_batch(self) -> None:
         if not self.thumbnail_job_queue:
             self.thumbnail_job_after_id = None
+            self._update_gallery_initial_loading_visibility()
             return
 
         mode = self.mode_var.get()
@@ -1744,6 +2396,7 @@ class BeRealDownloaderApp:
             self.thumbnail_job_after_id = self.root.after(10, self._process_thumbnail_batch)
         else:
             self.thumbnail_job_after_id = None
+        self._update_gallery_initial_loading_visibility()
 
     def _cancel_thumbnail_loading(self) -> None:
         self.thumbnail_job_queue.clear()
@@ -1760,12 +2413,21 @@ class BeRealDownloaderApp:
             except Exception:
                 pass
         self.thumbnail_job_after_id = None
+        self._update_gallery_initial_loading_visibility()
 
     def _build_thumbnail(self, photo: MemoryPhoto, mode: str) -> Optional["ImageTk.PhotoImage"]:
         try:
             target_w = self._current_target_preview_width()
-            target_h = max(72, int(target_w * 1.8))
-            img = self._render_preview_image(photo, mode, target_w, target_h)
+            target_h = self._thumbnail_canvas_height(target_w)
+            source_side = min(720, max(320, int(max(target_w, target_h) * 2.1)))
+            img = self._render_preview_image(
+                photo,
+                mode,
+                target_w,
+                target_h,
+                source_max_side=source_side,
+                resample=Image.Resampling.BILINEAR,
+            )
             return ImageTk.PhotoImage(img)
         except Exception:
             return None
@@ -1974,10 +2636,11 @@ class BeRealDownloaderApp:
             win.destroy()
 
         for label in buttons:
-            btn = ttk.Button(
+            btn = self._create_modal_button(
                 button_row,
                 text=label,
                 command=lambda value=label: close_with(value),
+                default=(label == (default or buttons[0])),
             )
             btn.pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -1993,6 +2656,37 @@ class BeRealDownloaderApp:
         win.focus_force()
         self.root.wait_window(win)
         return str(chosen["value"])
+
+    def _create_modal_button(
+        self,
+        parent: tk.Widget,
+        text: str,
+        command,
+        default: bool = False,
+    ) -> ttk.Button:
+        button = ttk.Button(
+            parent,
+            text=text,
+            command=command,
+        )
+        if default:
+            try:
+                button.state(["focus"])
+            except Exception:
+                pass
+
+        def set_active(active: bool) -> None:
+            try:
+                if active:
+                    button.state(["active"])
+                else:
+                    button.state(["!active"])
+            except Exception:
+                pass
+
+        button.bind("<Enter>", lambda _e: set_active(True))
+        button.bind("<Leave>", lambda _e: set_active(False))
+        return button
 
     def _show_info_dialog(self, title: str, message: str, detail: str = "") -> None:
         self._show_modal_dialog(title, message, kind="info", detail=detail)
@@ -2105,9 +2799,22 @@ class BeRealDownloaderApp:
         self.download_cancel_button = None
         self.download_progress_cancel_var.set("Cancel Download")
 
-    def _render_preview_image(self, photo: MemoryPhoto, mode: str, max_w: int, max_h: int) -> "Image.Image":
-        source_max_side = min(2200, max(900, int(max(max_w, max_h) * 1.25)))
-        downloaded_output = self.history.get_output_path(photo.key, mode)
+    def _render_preview_image(
+        self,
+        photo: MemoryPhoto,
+        mode: str,
+        max_w: int,
+        max_h: int,
+        source_max_side: Optional[int] = None,
+        resample: Optional[int] = None,
+    ) -> "Image.Image":
+        if source_max_side is None:
+            source_max_side = min(2200, max(900, int(max(max_w, max_h) * 1.25)))
+        if resample is None:
+            resample = Image.Resampling.LANCZOS
+        downloaded_output: Optional[Path] = None
+        if mode in {MODE_FRONT_ONLY, MODE_BACK_ONLY}:
+            downloaded_output = self.history.get_output_path(photo.key, mode)
         if downloaded_output is not None and downloaded_output.exists():
             img = self._open_preview_image(downloaded_output, source_max_side)
         else:
@@ -2123,14 +2830,15 @@ class BeRealDownloaderApp:
                 if not photo.front_path.exists() or not photo.back_path.exists():
                     raise FileNotFoundError("Front or back image file is missing.")
                 base = self._open_preview_image(photo.back_path, source_max_side)
-                inset = self._open_preview_image(photo.front_path, max(520, int(source_max_side * 0.52)))
+                inset = self._open_preview_image(photo.front_path, max(240, int(source_max_side * 0.52)))
                 img = ImageExporter._compose(base=base, inset=inset)
             elif mode == MODE_BEREAL_BACK_TL:
                 if not photo.front_path.exists() or not photo.back_path.exists():
                     raise FileNotFoundError("Front or back image file is missing.")
                 base = self._open_preview_image(photo.front_path, source_max_side)
-                inset = self._open_preview_image(photo.back_path, max(520, int(source_max_side * 0.52)))
-                img = ImageExporter._compose(base=base, inset=inset)
+                inset = self._open_preview_image(photo.back_path, max(240, int(source_max_side * 0.52)))
+                reference = self._open_preview_image(photo.back_path, source_max_side)
+                img = ImageExporter._compose(base=base, inset=inset, canvas_reference=reference)
             else:
                 if not photo.front_path.exists():
                     raise FileNotFoundError("Front image file is missing.")
@@ -2138,7 +2846,7 @@ class BeRealDownloaderApp:
 
         if img.width > max_w or img.height > max_h:
             scale = min(max_w / img.width, max_h / img.height)
-            img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.Resampling.LANCZOS)
+            img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), resample)
         return img
 
     def _raise_preview_window(self, win: tk.Toplevel) -> None:
@@ -2625,6 +3333,17 @@ class BeRealDownloaderApp:
             dt = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
             hour = dt.strftime("%I").lstrip("0") or "0"
             return f"{dt.strftime('%B %d, %Y')} at {hour}:{dt.strftime('%M:%S %p')}"
+        except ValueError:
+            return value
+
+    @staticmethod
+    def _format_time_thumbnail(value: str) -> str:
+        if not value:
+            return "Unknown capture time"
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+            hour = dt.strftime("%I").lstrip("0") or "0"
+            return f"{dt.strftime('%b %d, %Y')} {hour}:{dt.strftime('%M %p')}"
         except ValueError:
             return value
 
