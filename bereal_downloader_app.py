@@ -62,9 +62,12 @@ CARD_BG_SELECTED = "#cfe8ff"
 CARD_BG_MISSING = "#ffe9e9"
 META_UI_BG = "#000000"
 META_UI_FG = "#ffffff"
-PREVIEW_ZOOM_MIN = 0.6
+PREVIEW_TEXT_FG = "#334155"
+CARD_HIGHLIGHT_SELECTED = "#111111"
+CARD_HIGHLIGHT_MISSING = "#c86b6b"
+PREVIEW_ZOOM_MIN = 0.01
 PREVIEW_ZOOM_MAX = 1.8
-PREVIEW_ZOOM_DEFAULT = 0.8
+PREVIEW_ZOOM_DEFAULT = 0.35
 PREVIEW_NAV_DEBOUNCE_MS = 45
 
 
@@ -551,7 +554,9 @@ class BeRealDownloaderApp:
         self.show_all_metadata_var = tk.BooleanVar(value=False)
         self.skip_existing_var = tk.BooleanVar(value=True)
         self.preview_zoom = PREVIEW_ZOOM_DEFAULT
-        self.zoom_label_var = tk.StringVar(value=f"{int(round(PREVIEW_ZOOM_DEFAULT * 100))}%")
+        self.zoom_label_var = tk.StringVar(value=f"{self._display_zoom_percent()}%")
+        self.zoom_percent_var = tk.IntVar(value=self._display_zoom_percent())
+        self.zoom_scale_var = tk.DoubleVar(value=float(self._display_zoom_percent()))
         self.status_var = tk.StringVar(value="Select an export folder and click Load Data.")
         self.selection_status_var = tk.StringVar(value="Selected: 0")
 
@@ -568,7 +573,7 @@ class BeRealDownloaderApp:
         self.scroller_tab: Optional[ttk.Frame] = None
         self.scroller_active: bool = False
         self.gallery_canvas: Optional[tk.Canvas] = None
-        self.gallery_inner: Optional[ttk.Frame] = None
+        self.gallery_inner: Optional[tk.Frame] = None
         self.gallery_scrollbar: Optional[ttk.Scrollbar] = None
         self.gallery_window_id: Optional[int] = None
         self.gallery_cards: List[Dict] = []
@@ -658,11 +663,11 @@ class BeRealDownloaderApp:
             pass
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=10)
+        outer = ttk.Frame(self.root, padding=6)
         outer.pack(fill=tk.BOTH, expand=True)
 
         path_frame = ttk.Frame(outer)
-        path_frame.pack(fill=tk.X, pady=(0, 8))
+        path_frame.pack(fill=tk.X, pady=(0, 4))
 
         ttk.Label(path_frame, text="Export folder:").pack(side=tk.LEFT)
         path_entry = ttk.Entry(path_frame, textvariable=self.path_var)
@@ -671,8 +676,8 @@ class BeRealDownloaderApp:
         ttk.Button(path_frame, text="Browse", command=self.on_browse).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(path_frame, text="Load Data", command=self.on_load_data).pack(side=tk.LEFT)
 
-        mode_frame = ttk.LabelFrame(outer, text="Download mode", padding=8)
-        mode_frame.pack(fill=tk.X, pady=(0, 8))
+        mode_frame = ttk.LabelFrame(outer, text="Download mode", padding=6)
+        mode_frame.pack(fill=tk.X, pady=(0, 4))
 
         for mode, label in MODE_LABELS.items():
             ttk.Radiobutton(
@@ -684,7 +689,7 @@ class BeRealDownloaderApp:
             ).pack(side=tk.LEFT, padx=(0, 18))
 
         action_frame = ttk.Frame(outer)
-        action_frame.pack(fill=tk.X, pady=(0, 8))
+        action_frame.pack(fill=tk.X, pady=(0, 4))
 
         ttk.Checkbutton(
             action_frame,
@@ -763,7 +768,7 @@ class BeRealDownloaderApp:
         self.scroller_active = self._is_scroller_tab_active()
 
         status = ttk.Label(outer, textvariable=self.status_var, anchor="w")
-        status.pack(fill=tk.X, pady=(8, 0))
+        status.pack(fill=tk.X, pady=(4, 0))
 
     def _is_scroller_tab_active(self) -> bool:
         if self.notebook is None or self.scroller_tab is None:
@@ -800,7 +805,7 @@ class BeRealDownloaderApp:
         self.update_gallery_scrollregion()
 
     def _build_scroller_tab(self, parent: ttk.Frame) -> None:
-        top = ttk.Frame(parent, padding=(8, 8, 8, 4))
+        top = ttk.Frame(parent, padding=(6, 4, 6, 2))
         top.pack(fill=tk.X)
 
         ttk.Label(
@@ -809,11 +814,30 @@ class BeRealDownloaderApp:
         ).pack(side=tk.LEFT)
         right_controls = ttk.Frame(top)
         right_controls.pack(side=tk.RIGHT)
-        ttk.Button(right_controls, text="-", width=3, command=self.on_zoom_out).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Label(right_controls, textvariable=self.zoom_label_var, width=6, anchor="center").pack(
-            side=tk.LEFT, padx=(0, 6)
+        min_percent, max_percent = self._zoom_percent_bounds()
+        zoom_scale = ttk.Scale(
+            right_controls,
+            from_=float(min_percent),
+            to=float(max_percent),
+            orient=tk.HORIZONTAL,
+            length=180,
+            variable=self.zoom_scale_var,
+            command=self.on_zoom_slider_changed,
         )
-        ttk.Button(right_controls, text="+", width=3, command=self.on_zoom_in).pack(side=tk.LEFT, padx=(0, 8))
+        zoom_scale.pack(side=tk.LEFT, padx=(0, 8))
+        zoom_spinbox = ttk.Spinbox(
+            right_controls,
+            from_=min_percent,
+            to=max_percent,
+            textvariable=self.zoom_percent_var,
+            width=5,
+            justify="right",
+            command=self.on_zoom_percent_commit,
+        )
+        zoom_spinbox.pack(side=tk.LEFT)
+        zoom_spinbox.bind("<Return>", self.on_zoom_percent_commit)
+        zoom_spinbox.bind("<FocusOut>", self.on_zoom_percent_commit)
+        ttk.Label(right_controls, text="%").pack(side=tk.LEFT, padx=(4, 10))
         ttk.Checkbutton(
             right_controls,
             text="Show metadata on all cards",
@@ -821,7 +845,7 @@ class BeRealDownloaderApp:
             command=self.on_toggle_all_metadata,
         ).pack(side=tk.LEFT)
 
-        self.scroller_container = ttk.Frame(parent, padding=(8, 4, 8, 8))
+        self.scroller_container = ttk.Frame(parent, padding=(6, 2, 6, 4))
         self.scroller_container.pack(fill=tk.BOTH, expand=True)
 
         self.gallery_canvas = tk.Canvas(
@@ -838,7 +862,7 @@ class BeRealDownloaderApp:
         self.gallery_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.gallery_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.gallery_inner = ttk.Frame(self.gallery_canvas)
+        self.gallery_inner = tk.Frame(self.gallery_canvas, bg=self._theme_background(), bd=0, highlightthickness=0)
         self.gallery_window_id = self.gallery_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
         for c in range(GALLERY_MAX_COLUMNS):
             self.gallery_inner.columnconfigure(c, weight=1)
@@ -862,6 +886,17 @@ class BeRealDownloaderApp:
                 return bg
         return CARD_BG_DEFAULT
 
+    def _zoom_percent_bounds(self) -> Tuple[int, int]:
+        min_percent = max(1, int(round((PREVIEW_ZOOM_MIN / PREVIEW_ZOOM_DEFAULT) * 100)))
+        max_percent = max(min_percent, int(round((PREVIEW_ZOOM_MAX / PREVIEW_ZOOM_DEFAULT) * 100)))
+        return min_percent, max_percent
+
+    def _display_zoom_percent(self) -> int:
+        return int(round((self.preview_zoom / PREVIEW_ZOOM_DEFAULT) * 100))
+
+    def _zoom_for_percent(self, percent: float) -> float:
+        return PREVIEW_ZOOM_DEFAULT * (percent / 100.0)
+
     def _configure_row_tags(self) -> None:
         self.table.tag_configure("missing", background="#ffe9e9")
 
@@ -875,18 +910,35 @@ class BeRealDownloaderApp:
         if abs(clamped - self.preview_zoom) < 0.005:
             return
         self.preview_zoom = clamped
-        self.zoom_label_var.set(f"{int(round(self.preview_zoom * 100))}%")
+        zoom_percent = self._display_zoom_percent()
+        self.zoom_label_var.set(f"{zoom_percent}%")
+        self.zoom_percent_var.set(zoom_percent)
+        self.zoom_scale_var.set(float(zoom_percent))
         self.last_target_preview_width = 0
         self._invalidate_preview_cache_for_resize()
         for card in self.gallery_cards:
             self.update_card_metadata_visibility(card)
         self._schedule_thumbnail_request(1)
 
-    def on_zoom_in(self) -> None:
-        self._set_preview_zoom(self.preview_zoom * 1.15)
+    def on_zoom_slider_changed(self, value: str) -> None:
+        try:
+            percent = float(value)
+        except (TypeError, ValueError):
+            return
+        self._set_preview_zoom(self._zoom_for_percent(percent))
 
-    def on_zoom_out(self) -> None:
-        self._set_preview_zoom(self.preview_zoom / 1.15)
+    def on_zoom_percent_commit(self, _event: Optional[tk.Event] = None) -> None:
+        min_percent, max_percent = self._zoom_percent_bounds()
+        try:
+            percent = int(float(self.zoom_percent_var.get()))
+        except (tk.TclError, ValueError):
+            percent = self._display_zoom_percent()
+        percent = max(min_percent, min(max_percent, percent))
+        self._set_preview_zoom(self._zoom_for_percent(percent))
+        percent = self._display_zoom_percent()
+        self.zoom_label_var.set(f"{percent}%")
+        self.zoom_percent_var.set(percent)
+        self.zoom_scale_var.set(float(percent))
 
     def refresh_scroller(self) -> None:
         if self.gallery_inner is None:
@@ -919,13 +971,14 @@ class BeRealDownloaderApp:
             padx=0,
             pady=0,
             cursor="hand2",
+            bg=self._theme_background(),
         )
 
         image_canvas = tk.Canvas(
             frame,
             bd=0,
             highlightthickness=0,
-            bg=CARD_BG_DEFAULT,
+            bg=self._theme_background(),
             cursor="hand2",
             width=360,
             height=520,
@@ -936,17 +989,17 @@ class BeRealDownloaderApp:
             180,
             260,
             text="",
-            fill="#111111",
+            fill=PREVIEW_TEXT_FG,
             font=("Helvetica", 14, "bold"),
             width=300,
             justify="center",
         )
-        meta_button_oval = image_canvas.create_oval(0, 0, 0, 0, fill="#ffffff", outline="#ffffff", width=1)
+        meta_button_oval = image_canvas.create_oval(0, 0, 0, 0, fill="#000000", outline="#000000", width=1)
         meta_button_text = image_canvas.create_text(
             0,
             0,
             text="i",
-            fill="#000000",
+            fill="#ffffff",
             font=("Helvetica", 11, "bold"),
         )
         image_canvas.tag_bind(
@@ -1035,7 +1088,7 @@ class BeRealDownloaderApp:
             canvas.itemconfigure(card["canvas_text_item"], text="", state="hidden")
         else:
             canvas.itemconfigure(card["canvas_image_item"], image="", state="hidden")
-            canvas.itemconfigure(card["canvas_text_item"], text=text, state="normal")
+            canvas.itemconfigure(card["canvas_text_item"], text=text, fill=PREVIEW_TEXT_FG, state="normal")
 
         canvas.image = image_obj
         self._position_meta_button(card)
@@ -1402,19 +1455,28 @@ class BeRealDownloaderApp:
         selected = photo.key in self.selected_photo_keys
         missing = (not photo.front_path.exists()) or (not photo.back_path.exists())
 
+        bg = self._theme_background()
+        border_color = bg
+        border_width = 0
         if selected:
-            bg = CARD_BG_SELECTED
+            border_color = CARD_HIGHLIGHT_SELECTED
+            border_width = 3
         elif missing:
-            bg = CARD_BG_MISSING
-        else:
-            bg = CARD_BG_DEFAULT
+            border_color = CARD_HIGHLIGHT_MISSING
+            border_width = 2
 
-        for widget in (card["frame"], card["image_canvas"]):
-            widget.configure(bg=bg)
+        card["frame"].configure(
+            bg=bg,
+            highlightbackground=border_color,
+            highlightcolor=border_color,
+            highlightthickness=border_width,
+        )
+        card["image_canvas"].configure(bg=bg)
         card["meta_overlay"].configure(bg=META_UI_BG)
         card["meta_label"].configure(bg=META_UI_BG, fg=META_UI_FG)
-        card["image_canvas"].itemconfigure(card["meta_button_oval"], fill="#ffffff", outline="#ffffff")
-        card["image_canvas"].itemconfigure(card["meta_button_text"], fill="#000000")
+        card["image_canvas"].itemconfigure(card["canvas_text_item"], fill=PREVIEW_TEXT_FG)
+        card["image_canvas"].itemconfigure(card["meta_button_oval"], fill="#000000", outline="#000000")
+        card["image_canvas"].itemconfigure(card["meta_button_text"], fill="#ffffff")
 
     def _schedule_thumbnail_request(self, delay_ms: int = 110) -> None:
         if not self.scroller_active:
