@@ -595,10 +595,12 @@ class BeRealDownloaderApp:
         self.download_progress_title_var = tk.StringVar(value="")
         self.download_progress_detail_var = tk.StringVar(value="")
         self.download_progress_counts_var = tk.StringVar(value="")
+        self.download_progress_cancel_var = tk.StringVar(value="Cancel Download")
         self.download_queue: Optional[queue.Queue] = None
         self.download_poll_after_id: Optional[str] = None
         self.download_state: Optional[Dict[str, object]] = None
         self.download_cancel_event = threading.Event()
+        self.download_cancel_button: Optional[ttk.Button] = None
 
         self._configure_app_identity()
         self._build_ui()
@@ -619,11 +621,19 @@ class BeRealDownloaderApp:
         if icon_path is None:
             return
 
+        if self._running_in_macos_app_bundle():
+            return
+
         try:
             self.app_icon_photo = tk.PhotoImage(file=str(icon_path))
             self.root.iconphoto(True, self.app_icon_photo)
         except Exception:
             self.app_icon_photo = None
+
+    def _running_in_macos_app_bundle(self) -> bool:
+        if sys.platform != "darwin":
+            return False
+        return any(parent.suffix == ".app" for parent in Path(__file__).resolve().parents)
 
     def _resolve_app_asset_path(self, name: str) -> Optional[Path]:
         script_dir = Path(__file__).resolve().parent
@@ -638,6 +648,8 @@ class BeRealDownloaderApp:
         return None
 
     def _set_window_icon(self, win: tk.Toplevel) -> None:
+        if self._running_in_macos_app_bundle():
+            return
         if self.app_icon_photo is None:
             return
         try:
@@ -1622,51 +1634,42 @@ class BeRealDownloaderApp:
         win.title(title)
         win.transient(self.root)
         win.resizable(False, False)
-        win.configure(bg="#ececec")
         self._set_window_icon(win)
 
-        body = tk.Frame(win, bg="#ececec", padx=24, pady=20)
+        body = ttk.Frame(win, padding=20)
         body.pack(fill=tk.BOTH, expand=True)
 
-        title_label = tk.Label(
+        title_label = ttk.Label(
             body,
             text=title,
-            bg="#ececec",
-            fg="#111111",
-            font=("Helvetica", 15, "bold"),
-            anchor="center",
-            justify=tk.CENTER,
+            font=("TkDefaultFont", 14, "bold"),
+            anchor="w",
+            justify=tk.LEFT,
         )
         title_label.pack(fill=tk.X, pady=(0, 6))
 
-        message_label = tk.Label(
+        message_label = ttk.Label(
             body,
             text=message,
-            bg="#ececec",
-            fg="#111111",
-            font=("Helvetica", 12),
+            font=("TkDefaultFont", 12),
             wraplength=500,
-            justify=tk.CENTER,
-            anchor="center",
+            justify=tk.LEFT,
+            anchor="w",
         )
         message_label.pack(fill=tk.X, pady=(12, 6))
 
         if detail:
-            detail_label = tk.Label(
+            detail_label = ttk.Label(
                 body,
                 text=detail,
-                bg="#ececec",
-                fg="#4f4f4f",
-                font=("Helvetica", 10),
+                font=("TkDefaultFont", 10),
                 wraplength=500,
-                justify=tk.CENTER,
-                anchor="center",
+                justify=tk.LEFT,
+                anchor="w",
             )
             detail_label.pack(fill=tk.X, pady=(2, 10))
 
-        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(6, 12))
-
-        button_row = tk.Frame(body, bg="#ececec")
+        button_row = ttk.Frame(body)
         button_row.pack(fill=tk.X, pady=(8, 0))
 
         def close_with(value: str) -> None:
@@ -1674,17 +1677,12 @@ class BeRealDownloaderApp:
             win.destroy()
 
         for label in buttons:
-            is_default = label == (default or buttons[0])
             btn = ttk.Button(
                 button_row,
                 text=label,
                 command=lambda value=label: close_with(value),
-                cursor="hand2",
-                default=tk.ACTIVE if is_default else tk.NORMAL,
             )
-            btn.pack(side=tk.LEFT, expand=True, padx=6)
-            if is_default:
-                btn.focus_set()
+            btn.pack(side=tk.RIGHT, padx=(8, 0))
 
         win.protocol("WM_DELETE_WINDOW", lambda: close_with(default or buttons[0]))
         win.bind("<Return>", lambda _event: close_with(default or buttons[0]))
@@ -1695,6 +1693,7 @@ class BeRealDownloaderApp:
         win.deiconify()
         win.grab_set()
         self._raise_preview_window(win)
+        win.focus_force()
         self.root.wait_window(win)
         return str(chosen["value"])
 
@@ -1726,30 +1725,27 @@ class BeRealDownloaderApp:
         win.title("Downloading BeReals")
         win.transient(self.root)
         win.resizable(False, False)
-        win.configure(bg="#ececec")
         win.protocol("WM_DELETE_WINDOW", self._request_cancel_download)
         self._set_window_icon(win)
 
-        body = tk.Frame(win, bg="#ececec", padx=24, pady=20)
+        body = ttk.Frame(win, padding=20)
         body.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(
+        ttk.Label(
             body,
             text="Downloading BeReals",
-            bg="#ececec",
-            fg="#111111",
-            font=("Helvetica", 15, "bold"),
-            anchor="center",
+            font=("TkDefaultFont", 14, "bold"),
+            anchor="w",
+            justify=tk.LEFT,
         ).pack(fill=tk.X, pady=(0, 6))
 
         self.download_progress_title_var.set(f"Preparing {total} export(s) in {mode_label}")
-        tk.Label(
+        ttk.Label(
             body,
             textvariable=self.download_progress_title_var,
-            bg="#ececec",
-            fg="#111111",
-            font=("Helvetica", 12),
-            anchor="center",
+            font=("TkDefaultFont", 12),
+            anchor="w",
+            justify=tk.LEFT,
         ).pack(fill=tk.X, pady=(12, 8))
 
         progress = ttk.Progressbar(body, mode="determinate", maximum=max(1, total), length=440)
@@ -1757,33 +1753,32 @@ class BeRealDownloaderApp:
         self.download_progress_bar = progress
 
         self.download_progress_detail_var.set("Starting...")
-        tk.Label(
+        ttk.Label(
             body,
             textvariable=self.download_progress_detail_var,
-            bg="#ececec",
-            fg="#333333",
-            font=("Helvetica", 11),
-            anchor="center",
-            justify=tk.CENTER,
+            font=("TkDefaultFont", 11),
+            anchor="w",
+            justify=tk.LEFT,
         ).pack(fill=tk.X, pady=(10, 6))
 
         self.download_progress_counts_var.set("Success: 0    Skipped: 0    Failed: 0")
-        tk.Label(
+        ttk.Label(
             body,
             textvariable=self.download_progress_counts_var,
-            bg="#ececec",
-            fg="#555555",
-            font=("Helvetica", 10),
-            anchor="center",
+            font=("TkDefaultFont", 10),
+            anchor="w",
+            justify=tk.LEFT,
         ).pack(fill=tk.X)
 
-        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(12, 12))
-
-        button_row = tk.Frame(body, bg="#ececec")
+        button_row = ttk.Frame(body)
         button_row.pack(fill=tk.X, pady=(14, 0))
-        ttk.Button(button_row, text="Cancel Download", command=self._request_cancel_download).pack(
-            side=tk.LEFT, expand=True
+        cancel_button = ttk.Button(
+            button_row,
+            textvariable=self.download_progress_cancel_var,
+            command=self._request_cancel_download,
         )
+        cancel_button.pack(side=tk.RIGHT)
+        self.download_cancel_button = cancel_button
 
         self._center_window_over_root(win)
         win.deiconify()
@@ -1796,6 +1791,9 @@ class BeRealDownloaderApp:
             return
         self.download_cancel_event.set()
         self.download_progress_detail_var.set("Cancel requested. Finishing the current file...")
+        self.download_progress_cancel_var.set("Canceling...")
+        if self.download_cancel_button is not None:
+            self.download_cancel_button.state(["disabled"])
 
     def _close_download_progress(self) -> None:
         if self.download_progress_window is not None:
@@ -1807,6 +1805,8 @@ class BeRealDownloaderApp:
                 pass
         self.download_progress_window = None
         self.download_progress_bar = None
+        self.download_cancel_button = None
+        self.download_progress_cancel_var.set("Cancel Download")
 
     def _render_preview_image(self, photo: MemoryPhoto, mode: str, max_w: int, max_h: int) -> "Image.Image":
         source_max_side = min(2200, max(900, int(max(max_w, max_h) * 1.25)))
@@ -2118,7 +2118,7 @@ class BeRealDownloaderApp:
         if existing_count and not self.skip_existing_var.get():
             mode_label = MODE_LABELS.get(mode, mode)
             should_overwrite = self._ask_confirm_dialog(
-                "Confirm overwrite",
+                "Confirm Overwrite",
                 f"{existing_count} selected export(s) already exist for {mode_label}.",
                 detail="Overwrite the existing image and metadata files?",
             )
