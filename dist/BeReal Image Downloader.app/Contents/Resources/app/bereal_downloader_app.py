@@ -1662,7 +1662,7 @@ class BeRealDownloaderApp:
             detail_label = ttk.Label(
                 body,
                 text=detail,
-                font=("TkDefaultFont", 10),
+                font=("TkDefaultFont", 12),
                 wraplength=500,
                 justify=tk.LEFT,
                 anchor="w",
@@ -1756,7 +1756,7 @@ class BeRealDownloaderApp:
         ttk.Label(
             body,
             textvariable=self.download_progress_detail_var,
-            font=("TkDefaultFont", 11),
+            font=("TkDefaultFont", 12),
             anchor="w",
             justify=tk.LEFT,
         ).pack(fill=tk.X, pady=(10, 6))
@@ -1765,7 +1765,7 @@ class BeRealDownloaderApp:
         ttk.Label(
             body,
             textvariable=self.download_progress_counts_var,
-            font=("TkDefaultFont", 10),
+            font=("TkDefaultFont", 12),
             anchor="w",
             justify=tk.LEFT,
         ).pack(fill=tk.X)
