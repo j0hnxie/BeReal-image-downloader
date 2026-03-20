@@ -62,11 +62,11 @@ CARD_BG_SELECTED = "#cfe8ff"
 CARD_BG_MISSING = "#ffe9e9"
 META_UI_BG = "#000000"
 META_UI_FG = "#ffffff"
-PREVIEW_TEXT_FG = "#334155"
+PREVIEW_TEXT_FG = "#000000"
 CARD_HIGHLIGHT_SELECTED = "#111111"
 CARD_HIGHLIGHT_MISSING = "#c86b6b"
-PREVIEW_ZOOM_MIN = 0.01
-PREVIEW_ZOOM_MAX = 1.8
+PREVIEW_ZOOM_MIN = 0.0035
+PREVIEW_ZOOM_MAX = 1.4
 PREVIEW_ZOOM_DEFAULT = 0.35
 PREVIEW_NAV_DEBOUNCE_MS = 45
 
@@ -555,7 +555,7 @@ class BeRealDownloaderApp:
         self.skip_existing_var = tk.BooleanVar(value=True)
         self.preview_zoom = PREVIEW_ZOOM_DEFAULT
         self.zoom_label_var = tk.StringVar(value=f"{self._display_zoom_percent()}%")
-        self.zoom_percent_var = tk.IntVar(value=self._display_zoom_percent())
+        self.zoom_percent_var = tk.StringVar(value=str(self._display_zoom_percent()))
         self.zoom_scale_var = tk.DoubleVar(value=float(self._display_zoom_percent()))
         self.status_var = tk.StringVar(value="Select an export folder and click Load Data.")
         self.selection_status_var = tk.StringVar(value="Selected: 0")
@@ -610,6 +610,7 @@ class BeRealDownloaderApp:
         self._configure_app_identity()
         self._build_ui()
         self._configure_row_tags()
+        self._configure_focus_management()
         self.root.after(0, self._focus_main_window_on_start)
 
     def _configure_app_identity(self) -> None:
@@ -825,18 +826,15 @@ class BeRealDownloaderApp:
             command=self.on_zoom_slider_changed,
         )
         zoom_scale.pack(side=tk.LEFT, padx=(0, 8))
-        zoom_spinbox = ttk.Spinbox(
+        zoom_entry = ttk.Entry(
             right_controls,
-            from_=min_percent,
-            to=max_percent,
             textvariable=self.zoom_percent_var,
             width=5,
             justify="right",
-            command=self.on_zoom_percent_commit,
         )
-        zoom_spinbox.pack(side=tk.LEFT)
-        zoom_spinbox.bind("<Return>", self.on_zoom_percent_commit)
-        zoom_spinbox.bind("<FocusOut>", self.on_zoom_percent_commit)
+        zoom_entry.pack(side=tk.LEFT)
+        zoom_entry.bind("<Return>", self.on_zoom_percent_commit)
+        zoom_entry.bind("<FocusOut>", self.on_zoom_percent_commit)
         ttk.Label(right_controls, text="%").pack(side=tk.LEFT, padx=(4, 10))
         ttk.Checkbutton(
             right_controls,
@@ -887,15 +885,42 @@ class BeRealDownloaderApp:
         return CARD_BG_DEFAULT
 
     def _zoom_percent_bounds(self) -> Tuple[int, int]:
-        min_percent = max(1, int(round((PREVIEW_ZOOM_MIN / PREVIEW_ZOOM_DEFAULT) * 100)))
-        max_percent = max(min_percent, int(round((PREVIEW_ZOOM_MAX / PREVIEW_ZOOM_DEFAULT) * 100)))
-        return min_percent, max_percent
+        return (1, 400)
 
     def _display_zoom_percent(self) -> int:
         return int(round((self.preview_zoom / PREVIEW_ZOOM_DEFAULT) * 100))
 
     def _zoom_for_percent(self, percent: float) -> float:
         return PREVIEW_ZOOM_DEFAULT * (percent / 100.0)
+
+    def _configure_focus_management(self) -> None:
+        self.root.bind_all("<Escape>", self.on_escape_unfocus, add="+")
+        self.root.bind_all("<Button-1>", self.on_global_pointer_unfocus, add="+")
+
+    def _is_text_input_widget(self, widget: tk.Widget) -> bool:
+        return widget.winfo_class() in {"Entry", "TEntry", "Spinbox", "TSpinbox", "Text"}
+
+    def _focus_primary_surface(self) -> None:
+        if self.preview_window is not None and self.preview_window.winfo_exists():
+            self.preview_window.focus_set()
+            return
+        if self.scroller_active and self.gallery_canvas is not None:
+            self.gallery_canvas.focus_set()
+            return
+        if self.table is not None:
+            self.table.focus_set()
+            return
+        self.root.focus_set()
+
+    def on_escape_unfocus(self, _event: tk.Event) -> str:
+        self._focus_primary_surface()
+        return "break"
+
+    def on_global_pointer_unfocus(self, event: tk.Event) -> None:
+        widget = event.widget
+        if widget is None or self._is_text_input_widget(widget):
+            return
+        self.root.after_idle(self._focus_primary_surface)
 
     def _configure_row_tags(self) -> None:
         self.table.tag_configure("missing", background="#ffe9e9")
@@ -912,7 +937,7 @@ class BeRealDownloaderApp:
         self.preview_zoom = clamped
         zoom_percent = self._display_zoom_percent()
         self.zoom_label_var.set(f"{zoom_percent}%")
-        self.zoom_percent_var.set(zoom_percent)
+        self.zoom_percent_var.set(str(zoom_percent))
         self.zoom_scale_var.set(float(zoom_percent))
         self.last_target_preview_width = 0
         self._invalidate_preview_cache_for_resize()
@@ -930,14 +955,14 @@ class BeRealDownloaderApp:
     def on_zoom_percent_commit(self, _event: Optional[tk.Event] = None) -> None:
         min_percent, max_percent = self._zoom_percent_bounds()
         try:
-            percent = int(float(self.zoom_percent_var.get()))
-        except (tk.TclError, ValueError):
+            percent = int(float(self.zoom_percent_var.get().strip()))
+        except (tk.TclError, ValueError, AttributeError):
             percent = self._display_zoom_percent()
         percent = max(min_percent, min(max_percent, percent))
         self._set_preview_zoom(self._zoom_for_percent(percent))
         percent = self._display_zoom_percent()
         self.zoom_label_var.set(f"{percent}%")
-        self.zoom_percent_var.set(percent)
+        self.zoom_percent_var.set(str(percent))
         self.zoom_scale_var.set(float(percent))
 
     def refresh_scroller(self) -> None:
@@ -985,6 +1010,27 @@ class BeRealDownloaderApp:
         )
         image_canvas.pack(anchor="center")
         canvas_image_item = image_canvas.create_image(0, 0, anchor="nw")
+        placeholder_rect = image_canvas.create_rectangle(
+            0,
+            0,
+            0,
+            0,
+            fill="#d7dbe0",
+            outline="#c6ccd4",
+            width=1,
+            stipple="gray50",
+            state="hidden",
+        )
+        selection_overlay = image_canvas.create_rectangle(
+            0,
+            0,
+            0,
+            0,
+            fill="",
+            outline="#9cc7f8",
+            width=3,
+            state="hidden",
+        )
         canvas_text_item = image_canvas.create_text(
             180,
             260,
@@ -1031,6 +1077,8 @@ class BeRealDownloaderApp:
             "frame": frame,
             "image_canvas": image_canvas,
             "canvas_image_item": canvas_image_item,
+            "placeholder_rect": placeholder_rect,
+            "selection_overlay": selection_overlay,
             "canvas_text_item": canvas_text_item,
             "meta_button_oval": meta_button_oval,
             "meta_button_text": meta_button_text,
@@ -1081,16 +1129,26 @@ class BeRealDownloaderApp:
 
         canvas.configure(width=width, height=height)
         canvas.coords(card["canvas_image_item"], 0, 0)
+        canvas.coords(card["placeholder_rect"], 0, 0, width, height)
+        canvas.coords(card["selection_overlay"], 0, 0, width, height)
         canvas.coords(card["canvas_text_item"], width / 2, height / 2)
 
         if image_obj is not None:
             canvas.itemconfigure(card["canvas_image_item"], image=image_obj, state="normal")
+            canvas.itemconfigure(card["placeholder_rect"], state="hidden")
             canvas.itemconfigure(card["canvas_text_item"], text="", state="hidden")
         else:
             canvas.itemconfigure(card["canvas_image_item"], image="", state="hidden")
+            canvas.itemconfigure(card["placeholder_rect"], state="normal")
             canvas.itemconfigure(card["canvas_text_item"], text=text, fill=PREVIEW_TEXT_FG, state="normal")
 
         canvas.image = image_obj
+        canvas.tag_raise(card["placeholder_rect"])
+        canvas.tag_raise(card["canvas_image_item"])
+        canvas.tag_raise(card["selection_overlay"])
+        canvas.tag_raise(card["canvas_text_item"])
+        canvas.tag_raise(card["meta_button_oval"])
+        canvas.tag_raise(card["meta_button_text"])
         self._position_meta_button(card)
 
     def _position_meta_button(self, card: Dict) -> None:
@@ -1208,7 +1266,7 @@ class BeRealDownloaderApp:
         # One card per row, intentionally smaller than full width.
         base_w = min(980, max(560, canvas_w - 220))
         zoomed = int(base_w * self.preview_zoom)
-        return min(1700, max(360, zoomed))
+        return min(1700, max(40, zoomed))
 
     def _handle_preview_width_change(self) -> None:
         new_width = self._current_target_preview_width()
@@ -1266,6 +1324,12 @@ class BeRealDownloaderApp:
     def on_gallery_item_click(self, idx: int, event: tk.Event, action: str = "single") -> None:
         if idx < 0 or idx >= len(self.photos):
             return
+
+        card = self.gallery_cards[idx]
+        if event.widget is card["image_canvas"]:
+            current_items = event.widget.find_withtag("current")
+            if current_items and current_items[0] in {card["meta_button_oval"], card["meta_button_text"]}:
+                return
 
         if self.gallery_canvas is not None:
             self.gallery_canvas.focus_set()
@@ -1456,24 +1520,22 @@ class BeRealDownloaderApp:
         missing = (not photo.front_path.exists()) or (not photo.back_path.exists())
 
         bg = self._theme_background()
-        border_color = bg
-        border_width = 0
-        if selected:
-            border_color = CARD_HIGHLIGHT_SELECTED
-            border_width = 3
-        elif missing:
-            border_color = CARD_HIGHLIGHT_MISSING
-            border_width = 2
-
         card["frame"].configure(
             bg=bg,
-            highlightbackground=border_color,
-            highlightcolor=border_color,
-            highlightthickness=border_width,
+            highlightbackground=CARD_HIGHLIGHT_MISSING if missing else bg,
+            highlightcolor=CARD_HIGHLIGHT_MISSING if missing else bg,
+            highlightthickness=2 if missing else 0,
         )
         card["image_canvas"].configure(bg=bg)
         card["meta_overlay"].configure(bg=META_UI_BG)
         card["meta_label"].configure(bg=META_UI_BG, fg=META_UI_FG)
+        card["image_canvas"].itemconfigure(
+            card["selection_overlay"],
+            fill="",
+            outline="#9cc7f8",
+            width=3,
+            state="normal" if selected else "hidden",
+        )
         card["image_canvas"].itemconfigure(card["canvas_text_item"], fill=PREVIEW_TEXT_FG)
         card["image_canvas"].itemconfigure(card["meta_button_oval"], fill="#000000", outline="#000000")
         card["image_canvas"].itemconfigure(card["meta_button_text"], fill="#ffffff")
@@ -1587,7 +1649,7 @@ class BeRealDownloaderApp:
     def _build_thumbnail(self, photo: MemoryPhoto, mode: str) -> Optional["ImageTk.PhotoImage"]:
         try:
             target_w = self._current_target_preview_width()
-            target_h = max(900, int(target_w * 1.8))
+            target_h = max(72, int(target_w * 1.8))
             img = self._render_preview_image(photo, mode, target_w, target_h)
             return ImageTk.PhotoImage(img)
         except Exception:
