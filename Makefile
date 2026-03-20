@@ -21,6 +21,8 @@ APP_PYTHON := $(VENV_DIR)/bin/python3
 PIP_FLAGS := --disable-pip-version-check
 MACOS_SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 CLANG := $(shell xcrun --find clang)
+PYTHON_EMBED_CFLAGS := $(shell /Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13-config --embed --cflags | sed 's/-arch x86_64//g')
+PYTHON_EMBED_LDFLAGS := $(shell /Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13-config --embed --ldflags)
 
 .PHONY: help venv deps doctor run icon app-icon app-bundle install-app uninstall-app reinstall-app open-app dmg clean distclean
 
@@ -72,9 +74,11 @@ launcher: $(NATIVE_LAUNCHER)
 $(NATIVE_LAUNCHER): packaging/native_launcher.m
 	mkdir -p $(BUILD_DIR)
 	$(CLANG) -arch arm64 -isysroot "$(MACOS_SDK)" \
+		$(PYTHON_EMBED_CFLAGS) \
 		-framework Foundation \
 		-o $(NATIVE_LAUNCHER) \
-		packaging/native_launcher.m
+		packaging/native_launcher.m \
+		$(PYTHON_EMBED_LDFLAGS)
 
 app-bundle: deps icon launcher
 	rm -rf "$(APP_BUNDLE)"
