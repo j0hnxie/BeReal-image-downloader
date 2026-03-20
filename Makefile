@@ -12,14 +12,17 @@ ICONSET_DIR := $(BUILD_DIR)/AppIcon.iconset
 ICNS_PATH := $(BUILD_DIR)/AppIcon.icns
 DMG_STAGING_DIR := $(BUILD_DIR)/dmg
 DMG_PATH := $(DIST_DIR)/$(APP_NAME).dmg
+NATIVE_LAUNCHER := $(BUILD_DIR)/bereal-launcher
 
 PYTHON ?= /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
 VENV_DIR := .venv
 PIP := $(VENV_DIR)/bin/pip
 APP_PYTHON := $(VENV_DIR)/bin/python3
 PIP_FLAGS := --disable-pip-version-check
+MACOS_SDK := $(shell xcrun --sdk macosx --show-sdk-path)
+CLANG := $(shell xcrun --find clang)
 
-.PHONY: help venv deps doctor run icon app-bundle install-app uninstall-app reinstall-app open-app dmg clean distclean
+.PHONY: help venv deps doctor run icon app-icon app-bundle install-app uninstall-app reinstall-app open-app dmg clean distclean
 
 help:
 	@echo "Available targets:"
@@ -28,6 +31,8 @@ help:
 	@echo "  make doctor        - Check Python, tkinter, and Pillow"
 	@echo "  make run           - Run the app from source"
 	@echo "  make icon          - Build the macOS .icns file from icon.png"
+	@echo "  make app-icon      - Build build/AppIcon.iconset and build/AppIcon.icns"
+	@echo "  make launcher      - Build the native macOS launcher binary"
 	@echo "  make app-bundle    - Build dist/$(APP_NAME).app"
 	@echo "  make install-app   - Install the app bundle into /Applications"
 	@echo "  make uninstall-app - Remove the installed app from /Applications"
@@ -51,29 +56,32 @@ doctor: deps
 run: deps
 	$(APP_PYTHON) bereal_downloader_app.py
 
-icon: $(ICNS_PATH)
+.PHONY: launcher
 
-$(ICNS_PATH): icon.png
+icon: deps $(ICNS_PATH)
+
+app-icon: icon
+
+$(ICNS_PATH): icon.png packaging/build_app_icon.py
 	rm -rf $(ICONSET_DIR)
-	mkdir -p $(ICONSET_DIR)
-	sips -z 16 16 icon.png --out $(ICONSET_DIR)/icon_16x16.png
-	sips -z 32 32 icon.png --out $(ICONSET_DIR)/icon_16x16@2x.png
-	sips -z 32 32 icon.png --out $(ICONSET_DIR)/icon_32x32.png
-	sips -z 64 64 icon.png --out $(ICONSET_DIR)/icon_32x32@2x.png
-	sips -z 128 128 icon.png --out $(ICONSET_DIR)/icon_128x128.png
-	sips -z 256 256 icon.png --out $(ICONSET_DIR)/icon_128x128@2x.png
-	sips -z 256 256 icon.png --out $(ICONSET_DIR)/icon_256x256.png
-	sips -z 512 512 icon.png --out $(ICONSET_DIR)/icon_256x256@2x.png
-	sips -z 512 512 icon.png --out $(ICONSET_DIR)/icon_512x512.png
-	cp icon.png $(ICONSET_DIR)/icon_512x512@2x.png
+	$(APP_PYTHON) packaging/build_app_icon.py icon.png $(ICONSET_DIR)
 	iconutil -c icns $(ICONSET_DIR) -o $(ICNS_PATH)
 
-app-bundle: deps icon
+launcher: $(NATIVE_LAUNCHER)
+
+$(NATIVE_LAUNCHER): packaging/native_launcher.m
+	mkdir -p $(BUILD_DIR)
+	$(CLANG) -arch arm64 -isysroot "$(MACOS_SDK)" \
+		-framework Foundation \
+		-o $(NATIVE_LAUNCHER) \
+		packaging/native_launcher.m
+
+app-bundle: deps icon launcher
 	rm -rf "$(APP_BUNDLE)"
 	mkdir -p "$(APP_MACOS)" "$(APP_RESOURCES)/app"
 	cp packaging/Info.plist "$(APP_CONTENTS)/Info.plist"
 	printf 'APPL????' > "$(APP_CONTENTS)/PkgInfo"
-	cp packaging/launcher.sh "$(APP_EXECUTABLE)"
+	cp "$(NATIVE_LAUNCHER)" "$(APP_EXECUTABLE)"
 	chmod +x "$(APP_EXECUTABLE)"
 	cp "$(ICNS_PATH)" "$(APP_RESOURCES)/AppIcon.icns"
 	cp bereal_downloader_app.py requirements.txt README.md icon.png "$(APP_RESOURCES)/app/"
