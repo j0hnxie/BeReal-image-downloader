@@ -824,7 +824,12 @@ class BeRealDownloaderApp:
         self.scroller_container = ttk.Frame(parent, padding=(8, 4, 8, 8))
         self.scroller_container.pack(fill=tk.BOTH, expand=True)
 
-        self.gallery_canvas = tk.Canvas(self.scroller_container, highlightthickness=0)
+        self.gallery_canvas = tk.Canvas(
+            self.scroller_container,
+            highlightthickness=0,
+            bd=0,
+            bg=self._theme_background(),
+        )
         self.gallery_scrollbar = ttk.Scrollbar(
             self.scroller_container, orient=tk.VERTICAL, command=self.gallery_canvas.yview
         )
@@ -848,6 +853,14 @@ class BeRealDownloaderApp:
         self.gallery_canvas.bind("<Down>", self.on_scroller_arrow_key)
         self.gallery_canvas.bind("<Command-a>", self.on_select_all_shortcut)
         self.gallery_canvas.bind("<Control-a>", self.on_select_all_shortcut)
+
+    def _theme_background(self) -> str:
+        style = ttk.Style()
+        for style_name in ("TFrame", "TNotebook", "TLabel"):
+            bg = style.lookup(style_name, "background")
+            if bg:
+                return bg
+        return CARD_BG_DEFAULT
 
     def _configure_row_tags(self) -> None:
         self.table.tag_configure("missing", background="#ffe9e9")
@@ -908,38 +921,46 @@ class BeRealDownloaderApp:
             cursor="hand2",
         )
 
-        image_label = tk.Label(
+        image_canvas = tk.Canvas(
             frame,
-            text="",
-            anchor="center",
-            justify="center",
-            bd=0,
-            highlightthickness=0,
-            fg="#111111",
-        )
-        image_label.pack(anchor="center")
-
-        meta_button = tk.Canvas(
-            image_label,
-            width=24,
-            height=24,
             bd=0,
             highlightthickness=0,
             bg=CARD_BG_DEFAULT,
             cursor="hand2",
+            width=360,
+            height=520,
         )
-        meta_button_oval = meta_button.create_oval(1, 1, 23, 23, fill="#ffffff", outline="#ffffff", width=1)
-        meta_button_text = meta_button.create_text(
-            12,
-            12,
+        image_canvas.pack(anchor="center")
+        canvas_image_item = image_canvas.create_image(0, 0, anchor="nw")
+        canvas_text_item = image_canvas.create_text(
+            180,
+            260,
+            text="",
+            fill="#111111",
+            font=("Helvetica", 14, "bold"),
+            width=300,
+            justify="center",
+        )
+        meta_button_oval = image_canvas.create_oval(0, 0, 0, 0, fill="#ffffff", outline="#ffffff", width=1)
+        meta_button_text = image_canvas.create_text(
+            0,
+            0,
             text="i",
             fill="#000000",
             font=("Helvetica", 11, "bold"),
         )
-        meta_button.bind("<Button-1>", lambda _e, k=photo.key: self.show_card_metadata(k))
-        meta_button.place(relx=1.0, x=-6, y=6, anchor="ne")
+        image_canvas.tag_bind(
+            meta_button_oval,
+            "<Button-1>",
+            lambda _e, k=photo.key: self._on_meta_button_click(k),
+        )
+        image_canvas.tag_bind(
+            meta_button_text,
+            "<Button-1>",
+            lambda _e, k=photo.key: self._on_meta_button_click(k),
+        )
 
-        meta_overlay = tk.Frame(image_label, bg=META_UI_BG, bd=0, highlightthickness=0)
+        meta_overlay = tk.Frame(image_canvas, bg=META_UI_BG, bd=0, highlightthickness=0)
         meta_label = tk.Label(
             meta_overlay,
             anchor="center",
@@ -955,8 +976,9 @@ class BeRealDownloaderApp:
             "index": idx,
             "photo": photo,
             "frame": frame,
-            "image_label": image_label,
-            "meta_button": meta_button,
+            "image_canvas": image_canvas,
+            "canvas_image_item": canvas_image_item,
+            "canvas_text_item": canvas_text_item,
             "meta_button_oval": meta_button_oval,
             "meta_button_text": meta_button_text,
             "meta_overlay": meta_overlay,
@@ -965,7 +987,7 @@ class BeRealDownloaderApp:
             "meta_after_id": None,
         }
 
-        for widget in (frame, image_label, meta_overlay, meta_label):
+        for widget in (frame, image_canvas, meta_overlay, meta_label):
             widget.bind("<Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e))
             widget.bind("<Shift-Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e))
             widget.bind("<Command-Button-1>", lambda e, i=idx: self.on_gallery_item_click(i, e, "toggle"))
@@ -980,11 +1002,52 @@ class BeRealDownloaderApp:
         return card
 
     def _populate_card_labels(self, card: Dict) -> None:
-        card["image_label"].configure(text="Loading preview...", image="")
+        self._set_card_canvas_image(card, None, "Loading preview...")
         card["meta_label"].configure(text="", fg=META_UI_FG, bg=META_UI_BG)
 
     def _set_meta_button_symbol(self, card: Dict, symbol: str) -> None:
-        card["meta_button"].itemconfigure(card["meta_button_text"], text=symbol)
+        card["image_canvas"].itemconfigure(card["meta_button_text"], text=symbol)
+
+    def _on_meta_button_click(self, photo_key: str) -> str:
+        self.show_card_metadata(photo_key)
+        return "break"
+
+    def _set_card_canvas_image(
+        self,
+        card: Dict,
+        image_obj: Optional["ImageTk.PhotoImage"],
+        text: str = "",
+    ) -> None:
+        canvas = card["image_canvas"]
+        if image_obj is not None:
+            width = image_obj.width()
+            height = image_obj.height()
+        else:
+            width = max(320, self._current_target_preview_width())
+            height = max(420, int(width * 1.4))
+
+        canvas.configure(width=width, height=height)
+        canvas.coords(card["canvas_image_item"], 0, 0)
+        canvas.coords(card["canvas_text_item"], width / 2, height / 2)
+
+        if image_obj is not None:
+            canvas.itemconfigure(card["canvas_image_item"], image=image_obj, state="normal")
+            canvas.itemconfigure(card["canvas_text_item"], text="", state="hidden")
+        else:
+            canvas.itemconfigure(card["canvas_image_item"], image="", state="hidden")
+            canvas.itemconfigure(card["canvas_text_item"], text=text, state="normal")
+
+        canvas.image = image_obj
+        self._position_meta_button(card)
+
+    def _position_meta_button(self, card: Dict) -> None:
+        canvas = card["image_canvas"]
+        width = max(1, int(canvas.winfo_width() or canvas.cget("width")))
+        cx = width - 18
+        cy = 18
+        radius = 11
+        canvas.coords(card["meta_button_oval"], cx - radius, cy - radius, cx + radius, cy + radius)
+        canvas.coords(card["meta_button_text"], cx, cy)
 
     def _cancel_card_metadata_job(self, card: Dict) -> None:
         after_id = card.get("meta_after_id")
@@ -1111,8 +1174,7 @@ class BeRealDownloaderApp:
         self._cancel_thumbnail_loading()
         self.gallery_thumbnail_refs.clear()
         for card in self.gallery_cards:
-            card["image_label"].configure(image="", text="Loading preview...")
-            card["image_label"].image = None
+            self._set_card_canvas_image(card, None, "Loading preview...")
 
     def on_gallery_inner_configure(self, _event: tk.Event) -> None:
         self.update_gallery_scrollregion()
@@ -1347,13 +1409,12 @@ class BeRealDownloaderApp:
         else:
             bg = CARD_BG_DEFAULT
 
-        for widget in (card["frame"], card["image_label"]):
+        for widget in (card["frame"], card["image_canvas"]):
             widget.configure(bg=bg)
         card["meta_overlay"].configure(bg=META_UI_BG)
         card["meta_label"].configure(bg=META_UI_BG, fg=META_UI_FG)
-        card["meta_button"].configure(bg=bg, highlightthickness=0)
-        card["meta_button"].itemconfigure(card["meta_button_oval"], fill="#ffffff", outline="#ffffff")
-        card["meta_button"].itemconfigure(card["meta_button_text"], fill="#000000")
+        card["image_canvas"].itemconfigure(card["meta_button_oval"], fill="#ffffff", outline="#ffffff")
+        card["image_canvas"].itemconfigure(card["meta_button_text"], fill="#000000")
 
     def _schedule_thumbnail_request(self, delay_ms: int = 110) -> None:
         if not self.scroller_active:
@@ -1387,8 +1448,7 @@ class BeRealDownloaderApp:
             card = self.gallery_cards[idx]
             key = (card["photo"].key, mode)
             if key in self.gallery_thumbnail_refs:
-                card["image_label"].configure(image=self.gallery_thumbnail_refs[key], text="")
-                card["image_label"].image = self.gallery_thumbnail_refs[key]
+                self._set_card_canvas_image(card, self.gallery_thumbnail_refs[key])
                 continue
             self.thumbnail_job_queue.append(idx)
             self.thumbnail_job_set.add(idx)
@@ -1437,11 +1497,9 @@ class BeRealDownloaderApp:
                     self.gallery_thumbnail_refs[key] = image_obj
 
             if image_obj is not None:
-                card["image_label"].configure(image=image_obj, text="")
-                card["image_label"].image = image_obj
+                self._set_card_canvas_image(card, image_obj)
             else:
-                card["image_label"].configure(image="", text="Preview unavailable")
-                card["image_label"].image = None
+                self._set_card_canvas_image(card, None, "Preview unavailable")
 
         if self.thumbnail_job_queue:
             self.thumbnail_job_after_id = self.root.after(10, self._process_thumbnail_batch)
