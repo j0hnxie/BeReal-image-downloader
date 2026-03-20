@@ -611,6 +611,7 @@ class BeRealDownloaderApp:
         self._build_ui()
         self._configure_row_tags()
         self._configure_focus_management()
+        self._configure_keyboard_shortcuts()
         self.root.after(0, self._focus_main_window_on_start)
 
     def _configure_app_identity(self) -> None:
@@ -897,6 +898,33 @@ class BeRealDownloaderApp:
         self.root.bind_all("<Escape>", self.on_escape_unfocus, add="+")
         self.root.bind_all("<Button-1>", self.on_global_pointer_unfocus, add="+")
 
+    def _configure_keyboard_shortcuts(self) -> None:
+        bindings = [
+            ("<Command-KeyPress-equal>", self.on_shortcut_zoom_in),
+            ("<Command-KeyPress-plus>", self.on_shortcut_zoom_in),
+            ("<Command-KeyPress-minus>", self.on_shortcut_zoom_out),
+            ("<Command-KeyPress-l>", self.on_shortcut_load_data),
+            ("<Command-KeyPress-o>", self.on_shortcut_browse),
+            ("<Command-KeyPress-L>", self.on_shortcut_load_data),
+            ("<Command-KeyPress-O>", self.on_shortcut_browse),
+            ("<Command-Shift-KeyPress-bracketleft>", self.on_shortcut_prev_tab),
+            ("<Command-KeyPress-braceleft>", self.on_shortcut_prev_tab),
+            ("<Command-Shift-KeyPress-bracketright>", self.on_shortcut_next_tab),
+            ("<Command-KeyPress-braceright>", self.on_shortcut_next_tab),
+            ("<Command-KeyPress-1>", self.on_shortcut_mode_front_only),
+            ("<Command-KeyPress-2>", self.on_shortcut_mode_back_only),
+            ("<Command-KeyPress-3>", self.on_shortcut_mode_bereal_front),
+            ("<Command-KeyPress-4>", self.on_shortcut_mode_bereal_back),
+            ("<Command-KeyPress-s>", self.on_shortcut_toggle_skip),
+            ("<Command-KeyPress-S>", self.on_shortcut_toggle_skip),
+            ("<Command-KeyPress-d>", self.on_shortcut_download_selected),
+            ("<Command-KeyPress-D>", self.on_shortcut_download_all),
+            ("<Command-KeyPress-i>", self.on_shortcut_toggle_metadata),
+            ("<Command-KeyPress-I>", self.on_shortcut_toggle_metadata),
+        ]
+        for sequence, handler in bindings:
+            self.root.bind_all(sequence, handler, add="+")
+
     def _is_text_input_widget(self, widget: tk.Widget) -> bool:
         return widget.winfo_class() in {"Entry", "TEntry", "Spinbox", "TSpinbox", "Text"}
 
@@ -921,6 +949,93 @@ class BeRealDownloaderApp:
         if widget is None or self._is_text_input_widget(widget):
             return
         self.root.after_idle(self._focus_primary_surface)
+
+    def _is_scroller_shortcut_available(self) -> bool:
+        return self._is_scroller_tab_active()
+
+    def _adjust_zoom_percent(self, delta: int) -> None:
+        if not self._is_scroller_shortcut_available():
+            return
+        min_percent, max_percent = self._zoom_percent_bounds()
+        current = self._display_zoom_percent()
+        target = max(min_percent, min(max_percent, current + delta))
+        self._set_preview_zoom(self._zoom_for_percent(target))
+
+    def _select_notebook_tab(self, target_tab: Optional[ttk.Frame]) -> None:
+        if self.notebook is None or target_tab is None:
+            return
+        self.notebook.select(target_tab)
+        self.on_notebook_tab_changed(None)
+        self._focus_primary_surface()
+
+    def on_shortcut_zoom_in(self, _event: tk.Event) -> str:
+        self._adjust_zoom_percent(10)
+        return "break"
+
+    def on_shortcut_zoom_out(self, _event: tk.Event) -> str:
+        self._adjust_zoom_percent(-10)
+        return "break"
+
+    def on_shortcut_load_data(self, _event: tk.Event) -> str:
+        self.on_load_data()
+        return "break"
+
+    def on_shortcut_browse(self, _event: tk.Event) -> str:
+        self.on_browse()
+        return "break"
+
+    def on_shortcut_prev_tab(self, _event: tk.Event) -> str:
+        if self._is_scroller_tab_active():
+            self._select_notebook_tab(self.table_tab)
+        else:
+            self._select_notebook_tab(self.scroller_tab)
+        return "break"
+
+    def on_shortcut_next_tab(self, _event: tk.Event) -> str:
+        if self._is_scroller_tab_active():
+            self._select_notebook_tab(self.table_tab)
+        else:
+            self._select_notebook_tab(self.scroller_tab)
+        return "break"
+
+    def _set_mode_shortcut(self, mode: str) -> None:
+        self.mode_var.set(mode)
+        self.on_export_mode_changed()
+
+    def on_shortcut_mode_front_only(self, _event: tk.Event) -> str:
+        self._set_mode_shortcut(MODE_FRONT_ONLY)
+        return "break"
+
+    def on_shortcut_mode_back_only(self, _event: tk.Event) -> str:
+        self._set_mode_shortcut(MODE_BACK_ONLY)
+        return "break"
+
+    def on_shortcut_mode_bereal_front(self, _event: tk.Event) -> str:
+        self._set_mode_shortcut(MODE_BEREAL_FRONT_TL)
+        return "break"
+
+    def on_shortcut_mode_bereal_back(self, _event: tk.Event) -> str:
+        self._set_mode_shortcut(MODE_BEREAL_BACK_TL)
+        return "break"
+
+    def on_shortcut_toggle_skip(self, _event: tk.Event) -> str:
+        self.skip_existing_var.set(not self.skip_existing_var.get())
+        return "break"
+
+    def on_shortcut_download_selected(self, _event: tk.Event) -> str:
+        self.on_download_selected()
+        return "break"
+
+    def on_shortcut_download_all(self, _event: tk.Event) -> str:
+        self.on_download_all()
+        return "break"
+
+    def on_shortcut_toggle_metadata(self, _event: tk.Event) -> str:
+        if not self._is_scroller_shortcut_available():
+            return "break"
+        self.show_all_metadata_var.set(not self.show_all_metadata_var.get())
+        self.on_toggle_all_metadata()
+        return "break"
 
     def _configure_row_tags(self) -> None:
         self.table.tag_configure("missing", background="#ffe9e9")
