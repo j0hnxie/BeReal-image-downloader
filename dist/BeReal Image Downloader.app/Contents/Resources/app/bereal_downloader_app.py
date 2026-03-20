@@ -69,6 +69,9 @@ PREVIEW_ZOOM_MIN = 0.0035
 PREVIEW_ZOOM_MAX = 1.4
 PREVIEW_ZOOM_DEFAULT = 0.35
 PREVIEW_NAV_DEBOUNCE_MS = 45
+SCROLLER_INITIAL_BATCH = 28
+SCROLLER_BATCH_SIZE = 16
+SCROLLER_PREFETCH_THRESHOLD = 10
 
 
 @dataclass
@@ -578,6 +581,10 @@ class BeRealDownloaderApp:
         self.gallery_window_id: Optional[int] = None
         self.gallery_cards: List[Dict] = []
         self.gallery_card_by_key: Dict[str, Dict] = {}
+        self.gallery_rendered_count: int = 0
+        self.gallery_loading_frame: Optional[ttk.Frame] = None
+        self.gallery_loading_bar: Optional[ttk.Progressbar] = None
+        self.scroller_append_after_id: Optional[str] = None
         self.gallery_thumbnail_refs: Dict[Tuple[str, str], "ImageTk.PhotoImage"] = {}
         self.card_meta_visible_keys: set[str] = set()
         self.thumbnail_job_queue = deque()
@@ -786,6 +793,7 @@ class BeRealDownloaderApp:
                 self.refresh_gallery_selection_styles()
                 self._schedule_thumbnail_request(1)
         else:
+            self._cancel_scroller_batch_append()
             self._cancel_thumbnail_loading()
 
     def request_scroller_refresh(self) -> None:
@@ -797,11 +805,15 @@ class BeRealDownloaderApp:
         if self.gallery_inner is None:
             return
         self._cancel_thumbnail_loading()
+        self._cancel_scroller_batch_append()
         for card in self.gallery_cards:
             self._cancel_card_metadata_job(card)
         self.gallery_thumbnail_refs.clear()
         self.gallery_cards.clear()
         self.gallery_card_by_key.clear()
+        self.gallery_rendered_count = 0
+        self.gallery_loading_frame = None
+        self.gallery_loading_bar = None
         for child in self.gallery_inner.winfo_children():
             child.destroy()
         self.update_gallery_scrollregion()
@@ -1085,20 +1097,101 @@ class BeRealDownloaderApp:
             return
 
         self._clear_scroller_widgets()
-
-        for idx, photo in enumerate(self.photos):
-            card = self._create_gallery_card(idx, photo)
-            self.gallery_cards.append(card)
-            self.gallery_card_by_key[photo.key] = card
-            self._place_card(card)
-
         self.last_target_preview_width = self._current_target_preview_width()
+        self._append_scroller_cards(SCROLLER_INITIAL_BATCH)
         self.update_gallery_scrollregion()
         if self.scroller_active:
             self._schedule_thumbnail_request(1)
         self.refresh_gallery_selection_styles()
         self.update_selection_status()
         self.scroller_needs_refresh = False
+
+    def _ensure_scroller_loading_widget(self) -> None:
+        if self.gallery_inner is None:
+            return
+        if self.gallery_loading_frame is not None and self.gallery_loading_frame.winfo_exists():
+            return
+
+        frame = ttk.Frame(self.gallery_inner, padding=(0, 8, 0, 12))
+        label = ttk.Label(frame, text="Loading more BeReals...")
+        label.pack()
+        bar = ttk.Progressbar(frame, mode="indeterminate", length=180)
+        bar.pack(pady=(8, 0))
+        self.gallery_loading_frame = frame
+        self.gallery_loading_bar = bar
+
+    def _show_scroller_loading_indicator(self) -> None:
+        self._ensure_scroller_loading_widget()
+        if self.gallery_loading_frame is None:
+            return
+        row = (self.gallery_rendered_count + GALLERY_MAX_COLUMNS - 1) // GALLERY_MAX_COLUMNS
+        self.gallery_loading_frame.grid(row=row, column=0, sticky="ew")
+        if self.gallery_loading_bar is not None:
+            self.gallery_loading_bar.start(10)
+        self.update_gallery_scrollregion()
+
+    def _hide_scroller_loading_indicator(self) -> None:
+        if self.gallery_loading_bar is not None:
+            self.gallery_loading_bar.stop()
+        if self.gallery_loading_frame is not None and self.gallery_loading_frame.winfo_exists():
+            self.gallery_loading_frame.grid_remove()
+        self.update_gallery_scrollregion()
+
+    def _cancel_scroller_batch_append(self) -> None:
+        if self.scroller_append_after_id is not None:
+            try:
+                self.root.after_cancel(self.scroller_append_after_id)
+            except Exception:
+                pass
+        self.scroller_append_after_id = None
+        self._hide_scroller_loading_indicator()
+
+    def _schedule_scroller_batch_append(self) -> None:
+        if self.scroller_append_after_id is not None or self.gallery_rendered_count >= len(self.photos):
+            return
+        self._show_scroller_loading_indicator()
+        self.scroller_append_after_id = self.root.after_idle(self._run_scroller_batch_append)
+
+    def _run_scroller_batch_append(self) -> None:
+        self.scroller_append_after_id = None
+        self._append_scroller_cards(SCROLLER_BATCH_SIZE)
+        self._hide_scroller_loading_indicator()
+        self.update_gallery_scrollregion()
+        if self.scroller_active:
+            self._schedule_thumbnail_request(1)
+
+    def _append_scroller_cards(self, batch_size: int) -> None:
+        if self.gallery_inner is None or batch_size <= 0:
+            return
+        start = self.gallery_rendered_count
+        end = min(len(self.photos), start + batch_size)
+        if end <= start:
+            return
+
+        for idx in range(start, end):
+            photo = self.photos[idx]
+            card = self._create_gallery_card(idx, photo)
+            self.gallery_cards.append(card)
+            self.gallery_card_by_key[photo.key] = card
+            self._place_card(card)
+
+        self.gallery_rendered_count = end
+
+    def _maybe_append_scroller_batch(self, force: bool = False) -> None:
+        if self.gallery_canvas is None or self.gallery_rendered_count >= len(self.photos):
+            return
+
+        if not force:
+            y0, y1 = self.gallery_canvas.yview()
+            visible_indices = self._visible_card_indices()
+            max_visible = max(visible_indices, default=-1)
+            remaining_rendered = self.gallery_rendered_count - max_visible - 1
+            near_bottom = y1 >= 0.72
+            near_end = max_visible >= (self.gallery_rendered_count - SCROLLER_PREFETCH_THRESHOLD)
+            if remaining_rendered > (SCROLLER_PREFETCH_THRESHOLD + 2) and not near_bottom and not near_end:
+                return
+
+        self._schedule_scroller_batch_append()
 
     def _create_gallery_card(self, idx: int, photo: MemoryPhoto) -> Dict:
         assert self.gallery_inner is not None
@@ -1110,7 +1203,7 @@ class BeRealDownloaderApp:
             highlightthickness=0,
             padx=0,
             pady=0,
-            cursor="hand2",
+            cursor="arrow",
             bg=self._theme_background(),
         )
 
@@ -1119,7 +1212,7 @@ class BeRealDownloaderApp:
             bd=0,
             highlightthickness=0,
             bg=self._theme_background(),
-            cursor="hand2",
+            cursor="arrow",
             width=360,
             height=520,
         )
@@ -1173,6 +1266,8 @@ class BeRealDownloaderApp:
             "<Button-1>",
             lambda _e, k=photo.key: self._on_meta_button_click(k),
         )
+        image_canvas.bind("<Motion>", lambda e, c=idx: self._update_card_cursor(c, e))
+        image_canvas.bind("<Leave>", self._reset_card_cursor)
 
         meta_overlay = tk.Frame(image_canvas, bg=META_UI_BG, bd=0, highlightthickness=0)
         meta_label = tk.Label(
@@ -1227,6 +1322,19 @@ class BeRealDownloaderApp:
     def _on_meta_button_click(self, photo_key: str) -> str:
         self.show_card_metadata(photo_key)
         return "break"
+
+    def _update_card_cursor(self, idx: int, event: tk.Event) -> None:
+        if idx < 0 or idx >= len(self.gallery_cards):
+            return
+        card = self.gallery_cards[idx]
+        current_items = event.widget.find_withtag("current")
+        if current_items and current_items[0] in {card["meta_button_oval"], card["meta_button_text"]}:
+            event.widget.configure(cursor="hand2")
+        else:
+            event.widget.configure(cursor="arrow")
+
+    def _reset_card_cursor(self, event: tk.Event) -> None:
+        event.widget.configure(cursor="arrow")
 
     def _set_card_canvas_image(
         self,
@@ -1408,6 +1516,7 @@ class BeRealDownloaderApp:
     def on_gallery_canvas_configure(self, event: tk.Event) -> None:
         if self.gallery_window_id is not None and self.gallery_canvas is not None:
             self.gallery_canvas.itemconfigure(self.gallery_window_id, width=event.width)
+        self._maybe_append_scroller_batch(force=len(self.gallery_cards) == 0)
         self.update_gallery_scrollregion()
         self._handle_preview_width_change()
         self._schedule_thumbnail_request()
@@ -1434,6 +1543,7 @@ class BeRealDownloaderApp:
 
         if step != 0:
             self.gallery_canvas.yview_scroll(step, "units")
+            self._maybe_append_scroller_batch()
             self._schedule_thumbnail_request(120)
 
     def on_gallery_item_click(self, idx: int, event: tk.Event, action: str = "single") -> None:
@@ -1579,8 +1689,13 @@ class BeRealDownloaderApp:
         return "break"
 
     def _ensure_scroller_index_visible(self, idx: int) -> None:
-        if self.gallery_canvas is None or idx < 0 or idx >= len(self.gallery_cards):
+        if self.gallery_canvas is None or idx < 0 or idx >= len(self.photos):
             return
+        if idx >= len(self.gallery_cards):
+            self._cancel_scroller_batch_append()
+        while idx >= len(self.gallery_cards) and self.gallery_rendered_count < len(self.photos):
+            self._append_scroller_cards(SCROLLER_BATCH_SIZE)
+        self.update_gallery_scrollregion()
         frame = self.gallery_cards[idx]["frame"]
         self.root.update_idletasks()
         card_top = frame.winfo_y()
@@ -1672,6 +1787,8 @@ class BeRealDownloaderApp:
     def request_visible_thumbnail_loading(self) -> None:
         if not self.scroller_active or not self.gallery_cards or self.gallery_canvas is None:
             return
+
+        self._maybe_append_scroller_batch()
 
         mode = self.mode_var.get()
         visible_indices = self._visible_card_indices()
